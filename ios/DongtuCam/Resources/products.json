@@ -1,0 +1,50 @@
+[
+  {
+    "id": "herbal_soup",
+    "name": "药膳汤套餐",
+    "category": "药食同源",
+    "sellingPoint": "熟地黄枸杞汤底",
+    "person": "我妈",
+    "person2": "她",
+    "change": "连喝两周气色明显不一样了",
+    "reaction": "你最近换了什么",
+    "priceAnchor": "一顿不到二十",
+    "keywords": ["汤", "药膳", "熟地黄", "枸杞", "炖"]
+  },
+  {
+    "id": "pad",
+    "name": "卫生巾",
+    "category": "日用护理",
+    "sellingPoint": "超薄透气",
+    "person": "室友",
+    "person2": "她",
+    "change": "一整晚都没闷",
+    "reaction": "这也太能吸了吧",
+    "priceAnchor": "一包不到三十",
+    "keywords": ["卫生巾", "日用", "护理", "姨妈"]
+  },
+  {
+    "id": "tissue",
+    "name": "抽纸",
+    "category": "纸品",
+    "sellingPoint": "四层加厚不掉屑",
+    "person": "同事",
+    "person2": "她",
+    "change": "整包被顺走了半包",
+    "reaction": "你这纸哪买的",
+    "priceAnchor": "一箱不到四十",
+    "keywords": ["纸巾", "抽纸", "纸品", "餐巾纸"]
+  },
+  {
+    "id": "spray",
+    "name": "双瓶喷雾",
+    "category": "清洁护理",
+    "sellingPoint": "一喷即净",
+    "person": "婆婆",
+    "person2": "她",
+    "change": "灶台三天没擦还是亮的",
+    "reaction": "以为我请了保洁",
+    "priceAnchor": "两瓶不到五十",
+    "keywords": ["喷雾", "清洁", "去污", "厨房"]
+  }
+]

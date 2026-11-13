@@ -1,0 +1,16 @@
+# Xcode 用户与构建产物
+*.xcuserstate
+xcuserdata/
+DerivedData/
+build/
+*.xcodeproj
+*.xcworkspace
+!project.yml
+
+# macOS
+.DS_Store
+
+# 签名私钥 / 描述文件，绝不入库
+*.mobileprovision
+*.p12
+*.cer

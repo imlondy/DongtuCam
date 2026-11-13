@@ -1,0 +1,54 @@
+{
+  "version": "1.0",
+  "source": "dongtu-viral-copy / 程颖本程三段式公式",
+  "formula": "具体的人 + 已发生的变化 + 第三方的反应",
+  "principles": [
+    "只写结果不写过程",
+    "人要具体，禁止很多人/大家",
+    "反应必须由第三方发出，不能自夸",
+    "整段常驻画面，禁止分句硬切"
+  ],
+  "placeholders": ["{pname}", "{category}", "{point}", "{person}", "{person2}", "{change}", "{reaction}", "{price}"],
+  "templates": [
+    {
+      "id": "t1",
+      "lines": [
+        "{person}翻我包找{pname}",
+        "忽然停手捏住那一小包：",
+        "“{reaction}”",
+        "我还没来得及开口",
+        "{person2}直接拍照要了链接!!"
+      ]
+    },
+    {
+      "id": "t2",
+      "lines": [
+        "{person}盯着我看了三秒",
+        "才憋出一句：",
+        "“{change}？”",
+        "{price}我还以为很贵",
+        "结果当场要了同款!!"
+      ]
+    },
+    {
+      "id": "t3",
+      "lines": [
+        "把{pname}摆桌上那天",
+        "{person}路过顺手拿起来",
+        "翻来覆去看了半天：",
+        "“{reaction}”",
+        "晚上就发了三条消息问链接!!"
+      ]
+    },
+    {
+      "id": "t4",
+      "lines": [
+        "{person}以为我换了{pname}",
+        "其实只是{point}",
+        "{change}之后",
+        "“{reaction}”成了口头禅",
+        "{price}她不信!!"
+      ]
+    }
+  ]
+}

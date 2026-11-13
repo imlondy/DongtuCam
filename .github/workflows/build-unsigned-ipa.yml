@@ -1,0 +1,46 @@
+# 没有 Mac 时：把整个 ios/DongtuCam 目录推到 GitHub 仓库，
+# Actions 里手动触发本 workflow，下载产物 DongtuCam-unsigned.ipa。
+# Windows 上用 Sideloadly + 免费 Apple ID 签名侧载（7 天重签一次），
+# 或在有 Mac 的机器上直接用 Xcode 免费签名直装。
+name: build-unsigned-ipa
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: |
+          xcodegen generate \
+            --spec ios/DongtuCam/project.yml \
+            --project ios/DongtuCam/DongtuCam.xcodeproj
+
+      - name: Build unsigned
+        run: |
+          xcodebuild \
+            -project ios/DongtuCam/DongtuCam.xcodeproj \
+            -scheme DongtuCam \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            clean build
+
+      - name: Pack ipa
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/DongtuCam.app Payload/
+          zip -qr DongtuCam-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DongtuCam-unsigned-ipa
+          path: DongtuCam-unsigned.ipa

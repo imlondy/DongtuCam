@@ -1,0 +1,27 @@
+# XcodeGen 配置：避免手写易错的 project.pbxproj
+# 用法（Mac）：brew install xcodegen && xcodegen generate --spec project.yml
+name: DongtuCam
+options:
+  bundleIdPrefix: com.dongtu
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    CODE_SIGN_STYLE: Automatic
+    # 免费 Apple ID 直装：把这里换成你自己的 Team ID（Xcode 里也能自动填）
+    DEVELOPMENT_TEAM: ""
+targets:
+  DongtuCam:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+      - Resources
+    info:
+      path: Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.dongtu.cam

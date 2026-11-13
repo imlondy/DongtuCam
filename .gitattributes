@@ -1,0 +1,8 @@
+# 跨平台文本文件统一 LF，避免 Windows 提交时 CRLF 干扰 macOS 编译与 Actions 脚本
+*.swift text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.plist text eol=lf
+*.md text eol=lf
+*.sh text eol=lf

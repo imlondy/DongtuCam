@@ -1,0 +1,12 @@
+# 只推 iOS 工程与 Actions 工作流，其余本地产物一律不入库
+studio/
+material/
+pad34_out/
+_livephoto_maker/
+.workbuddy/
+dongtu-viral-copy.zip
+*.html
+
+# 系统与通用
+.DS_Store
+Thumbs.db
