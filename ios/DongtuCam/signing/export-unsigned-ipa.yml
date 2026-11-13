@@ -18,14 +18,14 @@ jobs:
 
       - name: Generate Xcode project
         run: |
-          xcodegen generate \
-            --spec ios/DongtuCam/project.yml \
-            --project ios/DongtuCam/DongtuCam.xcodeproj
+          cd ios/DongtuCam
+          xcodegen generate --spec project.yml
 
       - name: Build unsigned
         run: |
+          cd ios/DongtuCam
           xcodebuild \
-            -project ios/DongtuCam/DongtuCam.xcodeproj \
+            -project DongtuCam.xcodeproj \
             -scheme DongtuCam \
             -configuration Release \
             -sdk iphoneos \
@@ -37,7 +37,7 @@ jobs:
       - name: Pack ipa
         run: |
           mkdir -p Payload
-          cp -R build/Build/Products/Release-iphoneos/DongtuCam.app Payload/
+          cp -R ios/DongtuCam/build/Build/Products/Release-iphoneos/DongtuCam.app Payload/
           zip -qr DongtuCam-unsigned.ipa Payload
 
       - uses: actions/upload-artifact@v4
