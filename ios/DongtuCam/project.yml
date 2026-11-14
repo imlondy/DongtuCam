@@ -20,11 +20,21 @@ targets:
     sources:
       - Sources
       - Resources
-    # 注意：这里必须是「字符串形式」= 直接使用现有 Info.plist 原样打包，
-    # 千万不能写成 info: { path: Info.plist } 这种字典形式——XcodeGen 会把
-    # Info.plist 重新生成为默认模板，丢掉 NSCameraUsageDescription 等隐私权限键，
-    # 导致 App 一调相机就被系统 TCC 直接 SIGABRT 闪退。
-    info: Info.plist
+    # 注意：XcodeGen 的 info 只接受字典形式，且「只有 path」时会重新生成默认
+    # Info.plist 丢掉自定义键。必须用 properties 显式声明隐私权限键，
+    # 否则 App 一调相机/麦克风/相册就被系统 TCC 判定缺 usage description 而闪退。
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: 动图相机
+        NSCameraUsageDescription: 拍摄商品实况动图
+        NSMicrophoneUsageDescription: 录制动图时同步录音（可在设置里关闭）
+        NSPhotoLibraryAddUsageDescription: 把生成好的实况动图直接保存到相册
+        UILaunchScreen: {}
+        UIRequiredDeviceCapabilities:
+          - arm64
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.dongtu.cam
