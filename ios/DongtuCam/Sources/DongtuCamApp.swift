@@ -66,7 +66,7 @@ struct ContentView: View {
     @State private var recognitionDisabledThisRun = false
 
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
-    private let buildTag = "v14"
+    private let buildTag = "v15"
     /// 预览文字的磅值（和下面 copyPreview 里的 13 保持一致）
     private let previewFontPt: CGFloat = 13
 
@@ -120,6 +120,11 @@ struct ContentView: View {
             // 宁可少一个功能，也不能让用户每次拍都闪退。
             let fragile = ["copy.recognize", "process.frame", "process.text",
                            "process.compose", "burn.", "process.save", "camera.record"]
+            // 压字通道单独记一笔：崩在这条路上就自动关掉它，其余功能不受影响
+            if incident.contains("burn.video") {
+                OutputPrefs.burnIntoVideo = false
+                statusText = "已关闭「文案压进动图」（上次崩在这一步）"
+            }
             if fragile.contains(where: { incident.contains($0) }) {
                 let strikes = UserDefaults.standard.integer(forKey: "dtc.crash.strikes") + 1
                 UserDefaults.standard.set(strikes, forKey: "dtc.crash.strikes")
@@ -455,10 +460,12 @@ struct ContentView: View {
                 return
             }
 
-            statusText = "合成文字 → 写入相册…"
+            let burnVideo = OutputPrefs.burnIntoVideo
+            statusText = burnVideo ? "合成文字（照片 + 动图）→ 写入相册…" : "合成文字 → 写入相册…"
             Diagnostics.mark("process.compose")
             do {
-                let output = try await Self.compose(source: source, frame: frame, overlay: overlay)
+                let output = try await Self.compose(source: source, frame: frame,
+                                                    overlay: overlay, burnIntoVideo: burnVideo)
                 Diagnostics.mark("process.save")
                 statusText = "写入相册…"
                 do {
@@ -500,11 +507,12 @@ struct ContentView: View {
 
     // MARK: - 回调转 async（避免嵌套闭包写出花来）
 
-    private static func compose(source: URL, frame: CGImage,
-                                overlay: CGImage) async throws -> BurnOutput {
+    private static func compose(source: URL, frame: CGImage, overlay: CGImage,
+                                burnIntoVideo: Bool) async throws -> BurnOutput {
         try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<BurnOutput, Error>) in
-            BurnEngine.compose(source: source, frame: frame, overlay: overlay) { result in
+            BurnEngine.compose(source: source, frame: frame, overlay: overlay,
+                               burnIntoVideo: burnIntoVideo) { result in
                 continuation.resume(with: result)
             }
         }
