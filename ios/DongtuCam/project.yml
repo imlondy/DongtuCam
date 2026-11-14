@@ -27,13 +27,13 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: 动图相机
-        CFBundleShortVersionString: "20.0"
-        CFBundleVersion: "20"
+        CFBundleShortVersionString: "21.0"
+        CFBundleVersion: "21"
         NSCameraUsageDescription: 拍摄商品实况动图
         NSMicrophoneUsageDescription: 录制动图时同步录音（可在设置里关闭）
         NSPhotoLibraryAddUsageDescription: 把生成好的实况动图直接保存到相册
         # 写入失败时的兜底路径会申请「完整相册权限」，缺这个键会直接被 TCC 杀掉
-        NSPhotoLibraryUsageDescription: 保存实况动图遇到失败时，改用完整相册权限重试
+        NSPhotoLibraryUsageDescription: 配对成实况照片时需要回读刚写入的那一张，确认配对成功；失败时也用它兜底保存
         # 自建 AI 代理可能用 http，允许明文请求（仅侧载自用）
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
