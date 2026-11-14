@@ -109,8 +109,29 @@ final class CopyEngine: ObservableObject {
             }
         }
         lastTemplateIndex = index
-        lines = rules.templates[index].lines.map { Self.fill($0, with: product) }
+        lines = Self.normalize(rules.templates[index].lines.map { Self.fill($0, with: product) },
+                               product: product)
         badge = "本地"
+    }
+
+    /// 文案固定收成 3 行。
+    /// 界面与烧字都按「3 行」排版，AI 有时只给 2 行或给 4~5 行，
+    /// 行数一变最容易在 SwiftUI 里出现索引越界（闪退），所以这里统一归一。
+    private static func normalize(_ lines: [String], product: Product?) -> [String] {
+        var out = Array(lines.filter { !$0.isEmpty }.prefix(3))
+        guard out.count < 3, let product else { return out }
+        let fillers = [
+            "\(product.person)前两天还在问",
+            "\(product.change)",
+            "\(product.reaction)"
+        ]
+        var cursor = 0
+        while out.count < 3 && cursor < fillers.count {
+            let candidate = fillers[cursor]
+            cursor += 1
+            if !candidate.isEmpty && !out.contains(candidate) { out.append(candidate) }
+        }
+        return out
     }
 
     private static func fill(_ line: String, with product: Product) -> String {
@@ -157,7 +178,7 @@ final class CopyEngine: ObservableObject {
                     self.selected = hit
                     UserDefaults.standard.set(hit.id, forKey: Self.lastKey)
                 }
-                self.lines = output.lines
+                self.lines = Self.normalize(output.lines, product: self.selected)
                 self.badge = "AI"
                 self.note = "AI 文案 · " + (self.selected?.name ?? "")
             }
