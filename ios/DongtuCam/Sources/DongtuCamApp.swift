@@ -239,7 +239,8 @@ struct ContentView: View {
                 self.phase = .failed(error.localizedDescription)
                 self.statusText = "处理失败：\(error.localizedDescription)"
             case .success(let output):
-                LivePhotoWriter.save(still: output.stillURL, video: output.videoURL) { saved in
+                LivePhotoWriter.save(still: output.stillURL, video: output.videoURL,
+                                     report: output.report) { saved in
                     switch saved {
                     case .success:
                         self.phase = .done
