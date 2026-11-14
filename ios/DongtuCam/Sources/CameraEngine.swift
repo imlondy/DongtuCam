@@ -1,33 +1,38 @@
 import AVFoundation
 import CoreGraphics
-import CoreImage
 import Foundation
 
+enum CameraError: LocalizedError {
+    case busy
+    case notRunning
+
+    var errorDescription: String? {
+        switch self {
+        case .busy: return "上一段还在录制，稍等一下"
+        case .notRunning: return "相机没能启动，请退出重进（或检查相机权限）"
+        }
+    }
+}
+
 /// 打开即相机：固定录 5 秒短视频。
-/// 用「录视频」而不是系统 Live Photo 拍摄，是因为原生实况只有约 3 秒且不可控；
-/// 5 秒视频 + 抽帧 still 再交给 PhotoKit 写回，时长、文案、版式全部可控。
 ///
-/// 同时挂了一路视频数据输出，只为了在按下快门那一刻抓一帧给识别用；
-/// 平时自动丢帧，不参与录制，不影响成片。
-final class CameraEngine: NSObject, ObservableObject,
-                          AVCaptureFileOutputRecordingDelegate,
-                          AVCaptureVideoDataOutputSampleBufferDelegate {
+/// 历史教训（别再踩）：v11 曾在同一会话上再挂一路 `AVCaptureVideoDataOutput` 抓帧，
+/// 用于「按下快门立刻识别商品」。结果是：
+/// 1) 录制输出 + 数据输出同时挂在 2880x3840 的会话上，`startRecording` 容易抛 ObjC 异常；
+/// 2) 4K 缓冲池 + 每帧转 CGImage 让内存成倍上升，在手机上很容易被系统直接杀掉（表现为闪退）。
+/// 所以现在**只保留一路录制输出**，识别改为从成片首帧做（见 BurnEngine.previewFrame），
+/// 画面内容完全一样，只是晚 5 秒，换取稳定。
+final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordingDelegate {
     let session = AVCaptureSession()
     private let movieOutput = AVCaptureMovieFileOutput()
-    private let videoOutput = AVCaptureVideoDataOutput()
     private let sessionQueue = DispatchQueue(label: "dtc.camera.session")
     private var onFinish: ((Result<URL, Error>) -> Void)?
-
-    private let snapshotLock = NSLock()
-    private var snapshotContinuation: CheckedContinuation<CGImage?, Never>?
-    private var wantsSnapshot = false
-    private var videoOutputAttached = false
-    private static let ciContext = CIContext()
 
     @Published private(set) var isRecording = false
 
     override init() {
         super.init()
+        Diagnostics.mark("camera.init")
         configure()
     }
 
@@ -52,16 +57,10 @@ final class CameraEngine: NSObject, ObservableObject,
         if session.canAddOutput(movieOutput) {
             session.addOutput(movieOutput)
         }
-        // 抓帧用：不指定 videoSettings，走相机原生格式，避免录制时额外转码
-        videoOutput.alwaysDiscardsLateVideoFrames = true
-        if session.canAddOutput(videoOutput) {
-            session.addOutput(videoOutput)
-            videoOutput.setSampleBufferDelegate(self, queue: sessionQueue)
-            videoOutputAttached = true
-        }
         // 不强制设置 videoOrientation：由 AVAsset 的 preferredTransform
         // 在导出阶段自动转正，避免 deprecated API 与横竖屏错乱。
         session.commitConfiguration()
+        Diagnostics.mark("camera.configured")
     }
 
     /// 直接在相机层选 3:4 的视频格式（竖屏 3:4 / 横屏 4:3 旋转后也是 3:4），
@@ -76,7 +75,14 @@ final class CameraEngine: NSObject, ObservableObject,
             let ratio = CGFloat(dimension.width) / CGFloat(dimension.height)
             return abs(ratio - portrait) < 0.02 || abs(ratio - landscape) < 0.02
         }
-        guard let best = candidates.max(by: { a, b in
+        // 4K 级画面对手机内存压力大，优先挑 1080~1600 级里最大的那个：
+        // 抖音动图最终也是这个量级，清楚够用，且不会把内存顶到红线。
+        let preferred = candidates.filter { format in
+            let d = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            return min(Int(d.width), Int(d.height)) <= 1600
+        }
+        let pool = preferred.isEmpty ? candidates : preferred
+        guard let best = pool.max(by: { a, b in
             let lhs = CMVideoFormatDescriptionGetDimensions(a.formatDescription)
             let rhs = CMVideoFormatDescriptionGetDimensions(b.formatDescription)
             return Int(lhs.width) * Int(lhs.height) < Int(rhs.width) * Int(rhs.height)
@@ -93,16 +99,9 @@ final class CameraEngine: NSObject, ObservableObject,
     func start() {
         sessionQueue.async { [weak self] in
             guard let self, !self.session.isRunning else { return }
+            Diagnostics.mark("camera.start")
             self.session.startRunning()
-            // 保险：极少数机型/格式下多挂一路数据输出会让会话起不来，
-            // 表现为黑屏。此时摘掉抓帧输出再起一次，保证拍摄永远可用。
-            if !self.session.isRunning, self.videoOutputAttached {
-                self.session.beginConfiguration()
-                self.session.removeOutput(self.videoOutput)
-                self.videoOutputAttached = false
-                self.session.commitConfiguration()
-                self.session.startRunning()
-            }
+            Diagnostics.mark(self.session.isRunning ? "camera.running" : "camera.start-failed")
         }
     }
 
@@ -114,64 +113,31 @@ final class CameraEngine: NSObject, ObservableObject,
     }
 
     func capture(seconds: Double, completion: @escaping (Result<URL, Error>) -> Void) {
-        guard !movieOutput.isRecording else { return }
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("dtc-cam-\(UUID().uuidString).mov")
-        onFinish = completion
-        DispatchQueue.main.async { self.isRecording = true }
-        movieOutput.startRecording(to: url, recordingDelegate: self)
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
-            guard let self, self.movieOutput.isRecording else { return }
-            self.movieOutput.stopRecording()
-        }
-    }
-
-    // MARK: - 抓一帧（给商品识别用）
-
-    /// 取下一帧画面，最长等 1.2 秒；拿不到返回 nil（调用方自行兜底）
-    func snapshot() async -> CGImage? {
-        await withCheckedContinuation { continuation in
-            snapshotLock.lock()
-            if snapshotContinuation != nil {
-                snapshotLock.unlock()
-                continuation.resume(returning: nil)
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            guard !self.movieOutput.isRecording else {
+                DispatchQueue.main.async { completion(.failure(CameraError.busy)) }
                 return
             }
-            snapshotContinuation = continuation
-            wantsSnapshot = true
-            snapshotLock.unlock()
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-                self?.finishSnapshot(nil)
+            // 会话可能因为来电/切后台被系统停掉，这里先兜底拉起再录
+            if !self.session.isRunning { self.session.startRunning() }
+            guard self.session.isRunning,
+                  self.movieOutput.connection(with: .video) != nil else {
+                DispatchQueue.main.async { completion(.failure(CameraError.notRunning)) }
+                return
             }
-        }
-    }
+            Diagnostics.mark("camera.record")
 
-    private func finishSnapshot(_ image: CGImage?) {
-        snapshotLock.lock()
-        let continuation = snapshotContinuation
-        snapshotContinuation = nil
-        wantsSnapshot = false
-        snapshotLock.unlock()
-        continuation?.resume(returning: image)
-    }
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("dtc-cam-\(UUID().uuidString).mov")
+            self.onFinish = completion
+            DispatchQueue.main.async { self.isRecording = true }
+            self.movieOutput.startRecording(to: url, recordingDelegate: self)
 
-    func captureOutput(_ output: AVCaptureOutput,
-                       didOutput sampleBuffer: CMSampleBuffer,
-                       from connection: AVCaptureConnection) {
-        snapshotLock.lock()
-        let waiting = wantsSnapshot
-        snapshotLock.unlock()
-        guard waiting else { return }
-
-        guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let ciImage = CIImage(cvPixelBuffer: buffer)
-        guard let cgImage = Self.ciContext.createCGImage(ciImage, from: ciImage.extent) else {
-            return
-        }
-        DispatchQueue.main.async { [weak self] in
-            self?.finishSnapshot(cgImage)
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+                guard let self, self.movieOutput.isRecording else { return }
+                self.movieOutput.stopRecording()
+            }
         }
     }
 
@@ -184,6 +150,7 @@ final class CameraEngine: NSObject, ObservableObject,
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.isRecording = false
+            Diagnostics.mark("camera.recorded")
             let result: Result<URL, Error>
             if let error {
                 result = .failure(error)
