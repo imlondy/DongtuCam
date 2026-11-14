@@ -52,6 +52,7 @@ enum Phase {
 }
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var camera = CameraEngine()
     @StateObject private var copyEngine = CopyEngine()
     @StateObject private var aiSettings = AISettings()
@@ -66,7 +67,7 @@ struct ContentView: View {
     @State private var recognitionDisabledThisRun = false
 
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
-    private let buildTag = "v19"
+    private let buildTag = "v20"
     /// 预览文字的磅值（和下面 copyPreview 里的 13 保持一致）
     private let previewFontPt: CGFloat = 13
 
@@ -106,6 +107,11 @@ struct ContentView: View {
         }
         .onAppear(perform: onAppear)
         .onDisappear(perform: camera.stop)
+        // 正常切后台/退出留个记号：下次冷启动就不会把「用户自己关掉」
+        // 误判成「闪退」（v19 现场面板就是这么误报的）
+        .onChange(of: scenePhase) { phase in
+            if phase != .active { Diagnostics.mark("app.background") }
+        }
         .sheet(isPresented: $showSettings) {
             AISettingsView(settings: aiSettings, copyEngine: copyEngine)
         }
@@ -149,6 +155,9 @@ struct ContentView: View {
                 // 补存成功后不要再显示「上次现场」，避免用户以为又崩了
                 if lastError?.contains("上次现场") == true { lastError = nil }
             }
+            // 恢复走完就把面包屑清空：这一轮起点已知，文件里不会再残留
+            // 「启动+恢复」的十几行把真正的现场顶出窗口
+            Diagnostics.clear()
         }
     }
 
@@ -511,11 +520,16 @@ struct ContentView: View {
 
             if let video {
                 do {
-                    try await Self.saveLivePhoto(still: still.url, video: video.url, report: report)
+                    let outcome = try await Self.saveLivePhoto(still: still.url,
+                                                               video: video.url,
+                                                               report: report)
                     ShotStore.shared.finish(shotID)
                     phase = .done
                     lastError = nil
-                    statusText = "已存入相册 · 抖音「+ → 相册 → 动图」直接发"
+                    // 拿到完整相册权限时会回读确认；确认不了就不把话说满
+                    statusText = outcome.verifiedLive == true
+                        ? "已存入相册 · 系统已确认是实况 · 抖音「+ → 相册 → 动图」直接发"
+                        : "已存入相册 · 抖音「+ → 相册 → 动图」直接发"
                     Diagnostics.clear()
                     return
                 } catch {
@@ -616,9 +630,10 @@ struct ContentView: View {
         }
     }
 
-    private static func saveLivePhoto(still: URL, video: URL, report: String) async throws {
+    private static func saveLivePhoto(still: URL, video: URL,
+                                      report: String) async throws -> LivePhotoOutcome {
         try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
+            (continuation: CheckedContinuation<LivePhotoOutcome, Error>) in
             LivePhotoWriter.save(still: still, video: video, report: report) { result in
                 continuation.resume(with: result)
             }
