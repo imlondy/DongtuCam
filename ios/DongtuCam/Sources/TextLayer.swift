@@ -25,8 +25,8 @@ enum TextLayer {
     private static let maxLines = 5
     /// 描边宽度占字号的比例
     private static let strokeRatio: CGFloat = 0.026
-    /// 投影模糊半径占字号的比例
-    private static let shadowRatio: CGFloat = 0.075
+    /// 投影模糊半径占字号的比例（v17 收窄：投影一糊，小字号就发毛）
+    private static let shadowRatio: CGFloat = 0.04
 
     /// - Parameters:
     ///   - size: 成片画布尺寸（视频显示尺寸）
@@ -117,9 +117,9 @@ enum TextLayer {
         let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
 
         let shadow = NSShadow()
-        shadow.shadowColor = UIColor(white: 0, alpha: 0.55)
-        shadow.shadowBlurRadius = max(1.5, fontSize * shadowRatio)
-        shadow.shadowOffset = CGSize(width: 0, height: max(1, fontSize * 0.022))
+        shadow.shadowColor = UIColor(white: 0, alpha: 0.42)
+        shadow.shadowBlurRadius = max(1, fontSize * shadowRatio)
+        shadow.shadowOffset = CGSize(width: 0, height: max(1, fontSize * 0.016))
 
         let strokeWidth = -max(0.8, fontSize * strokeRatio)
 
