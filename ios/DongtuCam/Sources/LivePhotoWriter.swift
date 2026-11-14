@@ -105,6 +105,43 @@ enum LivePhotoWriter {
         }
     }
 
+    // MARK: - 降级：只存视频
+
+    /// 最后一道兜底：把视频原样存成普通视频。
+    ///
+    /// 这条不是「可选项」而是**安全网**：处理链路任何一步失败甚至进程被带走，
+    /// 只要原片还在，至少能让用户拿到一段视频（用户对 v13 的印象就是
+    /// 「闪退但相册里有视频」，说明这个兜底是有价值的）。
+    static func saveVideo(_ video: URL, completion: @escaping (Result<Void, Error>) -> Void) {
+        guard FileManager.default.fileExists(atPath: video.path) else {
+            completion(.failure(LivePhotoWriterError.failed("视频文件不存在")))
+            return
+        }
+        authorize(addOnly: true) { allowed in
+            guard allowed else {
+                completion(.failure(LivePhotoWriterError.denied))
+                return
+            }
+            PHPhotoLibrary.shared().performChanges {
+                let creation = PHAssetCreationRequest.forAsset()
+                let options = PHAssetResourceCreationOptions()
+                options.originalFilename = "DTC_CLIP.MOV"
+                // 不移动：暂存目录里的原片要留着，恢复流程可能还要用
+                options.shouldMoveFile = false
+                creation.addResource(with: .video, fileURL: video, options: options)
+            } completionHandler: { success, error in
+                DispatchQueue.main.async {
+                    if success {
+                        completion(.success(()))
+                    } else {
+                        let reason = error?.localizedDescription ?? "未知错误"
+                        completion(.failure(LivePhotoWriterError.failed("存视频失败：\(reason)")))
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - 依次尝试三种提交方式
 
     private enum Mode: String {
