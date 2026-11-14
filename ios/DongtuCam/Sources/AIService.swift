@@ -98,9 +98,6 @@ final class AISettings: ObservableObject {
         if let value = remote.useVision { next.useVision = value }
         if let value = remote.autoGenerateOnShoot { next.autoGenerateOnShoot = value }
         config = next
-        if let burn = remote.burnIntoVideo {
-            OutputPrefs.burnIntoVideo = burn
-        }
     }
 }
 
