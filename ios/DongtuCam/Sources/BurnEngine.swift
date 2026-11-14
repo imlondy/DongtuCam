@@ -28,9 +28,22 @@ enum BurnEngineError: LocalizedError {
     }
 }
 
-/// 产出一对能配成实况照片的文件：带文字的 HEIC 静帧 + 原始 MOV 视频。
+/// 产出一对能配成实况照片的文件：带文字的 HEIC 静帧 + 带文字的 MOV 视频。
 ///
-/// ## v14 的两个关键改动（都来自真机反馈）
+/// ## v15：文案重新回到动图里，但是「钉住」的
+///
+/// v14 为了根治模糊与抖动，把文字完全从视频里拿掉，结果动图播放时看不到字。
+/// v15 用一条独立通道把字补回去（`VideoBurner`）：
+///   AVAssetReader 出帧 → CIContext 把**同一张静态图层**贴到同一坐标 → AVAssetWriter 写帧
+/// 全程没有 `AVAssetExportSession`、没有 `applyingCIFiltersWithHandler`，
+/// 也就是 v11~v13 每轮闪退的那条「系统托管逐帧会话」根本不存在了。
+/// 文字位置逐帧完全一致，所以播放时字是钉在画面上的，不会跟着镜头晃。
+///
+/// 同时保留上一版最重要的一条：**静帧仍然用原始首帧 1:1 合成**，
+/// 不经过任何视频编解码往返，所以封面上的字依旧清晰。
+/// 压字失败会自动退回无损重封装，不会让这一拍白费。
+///
+/// ## v14 的后半段改动（仍然有效）
 ///
 /// 1. **文字只合成到静帧上，视频一点不碰。**
 ///    以前文字是烧进视频再抽一帧当静帧，于是：字跟着画面/播放动效一起动，
@@ -55,7 +68,11 @@ enum BurnEngine {
     ///   - source: 相机原始录制文件（未做任何处理）
     ///   - frame: 已转正的首帧，用来做静帧底图（尺寸 = 成片尺寸）
     ///   - overlay: 与 frame 同尺寸的透明文字层
+    ///   - burnIntoVideo: 是否把同一张文字层也逐帧压进视频（动图播放时也能看到字，位置固定）。
+    ///     走 `VideoBurner` 的 pixel-buffer 通路，失败会自动退化成无损重封装，
+    ///     不会因为这条路出问题而让这一拍白费。
     static func compose(source: URL, frame: CGImage, overlay: CGImage,
+                        burnIntoVideo: Bool = true,
                         completion: @escaping (Result<BurnOutput, Error>) -> Void) {
         let identifier = UUID().uuidString
 
@@ -90,20 +107,76 @@ enum BurnEngine {
                 return
             }
 
-            // 视频：原样 passthrough，只注入配对元数据
-            Diagnostics.mark("burn.remux")
-            remux(videoURL: source, identifier: identifier) { result in
+            // 视频：默认把文字层逐帧压进画面（动图播放也有字，位置固定）；
+            // 关掉时走原样 passthrough，只注入配对元数据。
+            let videoSize = CGSize(width: frame.width, height: frame.height)
+            finishVideo(source: source, overlay: overlay, renderSize: videoSize,
+                        identifier: identifier, burnIntoVideo: burnIntoVideo) { result in
                 switch result {
                 case .failure(let error):
                     completion(.failure(error))
-                case .success(let finalVideo):
+                case .success(let pair):
+                    let finalVideo = pair.url
                     Diagnostics.mark("burn.remux-ok")
                     let report = selfCheck(stillData: stillData, stillURL: stillURL,
                                            videoURL: finalVideo, identifier: identifier)
+                        + " vid=" + pair.mode
                     completion(.success(BurnOutput(stillURL: stillURL,
                                                    videoURL: finalVideo,
                                                    identifier: identifier,
                                                    report: report)))
+                }
+            }
+        }
+    }
+
+    /// 视频段结果：成片地址 + 走了哪条路（写进自检报告，方便排查）
+    private struct VideoResult {
+        let url: URL
+        let mode: String
+    }
+
+    /// 视频段的入口：先决定「要不要压字」，再统一走 remux 注入配对元数据。
+    ///
+    /// 两条路都收敛到 remux，是为了让**配对元数据只有一份实现**——
+    /// 那部分在 v10 起就稳定，不需要因为换了编码方式再冒一次 3302 的风险。
+    private static func finishVideo(source: URL, overlay: CGImage, renderSize: CGSize,
+                                    identifier: String, burnIntoVideo: Bool,
+                                    completion: @escaping (Result<VideoResult, Error>) -> Void) {
+        func fallbackToPassthrough(_ reason: String) {
+            Diagnostics.mark("burn.video-fallback")
+            remux(videoURL: source, identifier: identifier) { result in
+                switch result {
+                case .failure(let error):
+                    completion(.failure(error))
+                case .success(let url):
+                    completion(.success(VideoResult(url: url, mode: "burn=skip(\(reason))")))
+                }
+            }
+        }
+
+        guard burnIntoVideo else {
+            fallbackToPassthrough("off")
+            return
+        }
+
+        Diagnostics.mark("burn.video")
+        VideoBurner.burn(source: source, overlay: overlay, renderSize: renderSize) { result in
+            switch result {
+            case .failure(let error):
+                // 压字失败不能让这一拍白费：退回无损重封装，照片上仍然有字
+                let reason = (error as? LocalizedError)?.errorDescription ?? "fail"
+                fallbackToPassthrough(String(reason.prefix(28)))
+            case .success(let burned):
+                Diagnostics.mark("burn.video-ok")
+                remux(videoURL: burned, identifier: identifier) { remuxResult in
+                    switch remuxResult {
+                    case .failure(let error):
+                        completion(.failure(error))
+                    case .success(let url):
+                        try? FileManager.default.removeItem(at: burned)
+                        completion(.success(VideoResult(url: url, mode: "burn=on")))
+                    }
                 }
             }
         }
@@ -136,6 +209,7 @@ enum BurnEngine {
 
     private static func remux(videoURL: URL, identifier: String,
                               completion: @escaping (Result<URL, Error>) -> Void) {
+        Diagnostics.mark("burn.remux")
         let asset = AVAsset(url: videoURL)
         guard let videoTrack = asset.tracks(withMediaType: .video).first else {
             completion(.failure(BurnEngineError.noVideoTrack))
