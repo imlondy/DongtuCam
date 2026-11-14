@@ -25,31 +25,26 @@ enum BurnEngineError: LocalizedError {
 
 /// 产出可配对成 Live Photo 的一对文件（带文字的静帧 + 带文字的 H.264 视频）。
 ///
-/// 拆成两步，避开 AVAssetReaderVideoCompositionOutput 手动抽帧的崩溃（iOS 27 上
-/// applyingCIFiltersWithHandler 的 composition 再手动强设 renderSize/frameDuration
-/// 会触发 `_figAssetReaderSampleBufferDidBecomeAvailableForExtractionID` 内部异常）：
-///   第一步：AVAssetExportSession 烧字导出 H.264 MOV（简单、已验证稳定）；
-///   第二步：AVAssetReaderTrackOutput + AVAssetWriterInput 走 passthrough 无损重封装，
-///           只注入 Live Photo 配对元数据，不重新编码、不碰 CIFilter。
-///
-/// 元数据两条（对应已验证写法）：
-///   content.identifier —— 文件级，写 AVAssetWriter.metadata；
-///   still-image-time —— 轨道级 timed metadata，带 sourceFormatHint(SInt8)，值 -1。
+/// 三步走：
+///   ① AVAssetExportSession 烧字导出 H.264 MOV（保留音频，不手动设 renderSize/frameDuration）；
+///   ② passthrough 无损重封装（video + audio），注入 content.identifier（文件级）
+///      与 still-image-time（轨道级 timed metadata，值 0）；
+///   ③ 生成静帧：HEIC 优先，写入 MakerApple "17" 配对标识后**读回校验**，
+///      校验失败自动降级 JPEG；两者都带标识，保证 PhotoKit 能配对。
 enum BurnEngine {
     static func render(source: URL, overlay: CGImage, seconds: Double = 5.0,
                        completion: @escaping (Result<BurnOutput, Error>) -> Void) {
         let asset = AVAsset(url: source)
-        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+        guard asset.tracks(withMediaType: .video).first != nil else {
             completion(.failure(BurnEngineError.noVideoTrack))
             return
         }
-
         let identifier = UUID().uuidString
         let textCI = CIImage(cgImage: overlay)
         let duration = CMTimeMinimum(asset.duration,
                                      CMTime(seconds: seconds, preferredTimescale: 600))
 
-        // —— 第一步：AVAssetExportSession 烧字（不手动设 renderSize/frameDuration）——
+        // —— ① 烧字导出 ——
         let composition = AVMutableVideoComposition(
             asset: asset,
             applyingCIFiltersWithHandler: { request in
@@ -78,40 +73,58 @@ enum BurnEngine {
                 completion(.failure(BurnEngineError.writerFailed(reason)))
                 return
             }
-            // —— 第二步：passthrough 重封装 + 注入配对元数据 ——
-            injectMetadata(videoURL: intermediate, identifier: identifier) { injected in
-                switch injected {
+            // —— ② 重封装 + 元数据 ——
+            remuxWithMetadata(videoURL: intermediate, identifier: identifier) { remuxed in
+                switch remuxed {
                 case .failure(let e):
                     completion(.failure(e))
                 case .success(let finalVideo):
-                    completion(makeStill(asset: asset, textCI: textCI,
-                                         videoURL: finalVideo, identifier: identifier))
+                    // —— ③ 静帧 ——
+                    guard let still = makeStill(asset: asset, textCI: textCI,
+                                                identifier: identifier) else {
+                        completion(.failure(BurnEngineError.stillFailed))
+                        return
+                    }
+                    completion(.success(BurnOutput(stillURL: still, videoURL: finalVideo)))
                 }
             }
         }
     }
 
-    /// 无损重封装：读原视频 sample → 原样写回，只加两条 Live Photo 配对元数据
-    private static func injectMetadata(videoURL: URL, identifier: String,
-                                       completion: @escaping (Result<URL, Error>) -> Void) {
+    /// 无损重封装 video + audio，只加两条 Live Photo 配对元数据
+    private static func remuxWithMetadata(videoURL: URL, identifier: String,
+                                          completion: @escaping (Result<URL, Error>) -> Void) {
         let asset = AVAsset(url: videoURL)
-        guard let track = asset.tracks(withMediaType: .video).first else {
+        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
             completion(.failure(BurnEngineError.writerFailed("中间视频没有视频轨")))
             return
         }
+        let audioTrack = asset.tracks(withMediaType: .audio).first
         let outURL = tmpURL("burn.mov")
 
         do {
             let reader = try AVAssetReader(asset: asset)
-            let readerOutput = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
-            reader.add(readerOutput)
+            let videoOut = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
+            reader.add(videoOut)
+            var audioOut: AVAssetReaderTrackOutput?
+            if let audioTrack {
+                let o = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+                reader.add(o)
+                audioOut = o
+            }
 
             let writer = try AVAssetWriter(outputURL: outURL, fileType: .mov)
             writer.metadata = [contentIdentifierItem(identifier)]
 
-            // passthrough：不重新编码（格式由首个 sample buffer 自动推断）
             let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
             videoInput.expectsMediaDataInRealTime = false
+
+            var audioInput: AVAssetWriterInput?
+            if audioOut != nil {
+                let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+                ai.expectsMediaDataInRealTime = false
+                audioInput = ai
+            }
 
             let metadataInput = try makeStillImageTimeInput()
             metadataInput.expectsMediaDataInRealTime = false
@@ -122,6 +135,7 @@ enum BurnEngine {
                 return
             }
             writer.add(videoInput)
+            if let audioInput { writer.add(audioInput) }
             writer.add(metadataInput)
 
             guard writer.startWriting() else {
@@ -136,24 +150,47 @@ enum BurnEngine {
             let stillItem = AVMutableMetadataItem()
             stillItem.key = "com.apple.quicktime.still-image-time" as NSString
             stillItem.keySpace = .quickTimeMetadata
-            stillItem.value = -1 as NSNumber
+            stillItem.value = 0 as NSNumber
             stillItem.dataType = kCMMetadataBaseDataType_SInt8 as String
             metadataAdaptor.append(AVTimedMetadataGroup(
                 items: [stillItem],
                 timeRange: CMTimeRange(start: .zero, duration: asset.duration)))
 
-            let queue = DispatchQueue(label: "dtc.meta.write")
-            var done = false
-            videoInput.requestMediaDataWhenReady(on: queue) {
-                while videoInput.isReadyForMoreMediaData && !done {
-                    if let sample = readerOutput.copyNextSampleBuffer() {
-                        if !videoInput.append(sample) { done = true }
-                    } else {
-                        done = true
+            let group = DispatchGroup()
+
+            group.enter()
+            var vDone = false
+            videoInput.requestMediaDataWhenReady(on: DispatchQueue(label: "dtc.meta.video")) {
+                if vDone { return }
+                while videoInput.isReadyForMoreMediaData {
+                    guard let sample = videoOut.copyNextSampleBuffer(),
+                          videoInput.append(sample) else {
+                        vDone = true
+                        videoInput.markAsFinished()
+                        group.leave()
+                        return
                     }
                 }
-                guard done else { return }
-                videoInput.markAsFinished()
+            }
+
+            if let audioInput, let audioOut {
+                group.enter()
+                var aDone = false
+                audioInput.requestMediaDataWhenReady(on: DispatchQueue(label: "dtc.meta.audio")) {
+                    if aDone { return }
+                    while audioInput.isReadyForMoreMediaData {
+                        guard let sample = audioOut.copyNextSampleBuffer(),
+                              audioInput.append(sample) else {
+                            aDone = true
+                            audioInput.markAsFinished()
+                            group.leave()
+                            return
+                        }
+                    }
+                }
+            }
+
+            group.notify(queue: .main) {
                 metadataInput.markAsFinished()
                 writer.finishWriting {
                     DispatchQueue.main.async {
@@ -204,47 +241,75 @@ enum BurnEngine {
                                   sourceFormatHint: desc)
     }
 
-    /// 静帧：带文字 + HEIC + MakerApple "17" 配对标识
-    private static func makeStill(asset: AVAsset, textCI: CIImage,
-                                  videoURL: URL, identifier: String) -> Result<BurnOutput, Error> {
+    /// 静帧：带文字 + 写 MakerApple "17" 配对标识并读回校验（HEIC 优先，降级 JPEG）
+    private static func makeStill(asset: AVAsset, textCI: CIImage, identifier: String) -> URL? {
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
-        do {
-            let frame = try generator.copyCGImage(at: CMTime(value: 1, timescale: 24),
-                                                  actualTime: nil)
-            let stillCI = CIImage(cgImage: frame)
-            let sx = stillCI.extent.width / max(1, textCI.extent.width)
-            let sy = stillCI.extent.height / max(1, textCI.extent.height)
-            let fitted = textCI.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
-            let merged = fitted.composited(over: stillCI)
-            guard let out = CIContext().createCGImage(merged, from: merged.extent),
-                  let heic = heicData(from: out, identifier: identifier, quality: 0.9) else {
-                return .failure(BurnEngineError.stillFailed)
-            }
-            let outStill = tmpURL("still.heic")
-            try heic.write(to: outStill)
-            return .success(BurnOutput(stillURL: outStill, videoURL: videoURL))
-        } catch {
-            return .failure(error)
+        guard let frame = try? generator.copyCGImage(at: CMTime(value: 1, timescale: 24),
+                                                     actualTime: nil) else {
+            return nil
         }
+        let stillCI = CIImage(cgImage: frame)
+        let sx = stillCI.extent.width / max(1, textCI.extent.width)
+        let sy = stillCI.extent.height / max(1, textCI.extent.height)
+        let fitted = textCI.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
+        let merged = fitted.composited(over: stillCI)
+        guard let out = CIContext().createCGImage(merged, from: merged.extent) else {
+            return nil
+        }
+
+        // HEIC 优先（校验配对标识真的写进去了）
+        if let heic = encode(out, uti: "public.heic", identifier: identifier),
+           hasIdentifier(heic, identifier: identifier) {
+            let url = tmpURL("still.heic")
+            if (try? heic.write(to: url)) != nil { return url }
+        }
+        // 降级 JPEG（同样带标识）
+        if let jpeg = encode(out, uti: "public.jpeg", identifier: identifier),
+           hasIdentifier(jpeg, identifier: identifier) {
+            let url = tmpURL("still.jpg")
+            if (try? jpeg.write(to: url)) != nil { return url }
+        }
+        // 最后保底：JPEG（不再强校验）
+        if let jpeg = encode(out, uti: "public.jpeg", identifier: identifier) {
+            let url = tmpURL("still.jpg")
+            if (try? jpeg.write(to: url)) != nil { return url }
+        }
+        return nil
     }
 
-    /// 编码 HEIC，并把配对标识写进 MakerApple 元数据的 "17" 字段
-    private static func heicData(from image: CGImage, identifier: String, quality: CGFloat) -> Data? {
+    /// 编码图片并把配对标识写进 MakerApple 的 "17" 字段
+    private static func encode(_ image: CGImage, uti: String, identifier: String) -> Data? {
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(data as CFMutableData,
-                                                          "public.heic" as CFString, 1, nil) else {
+                                                          uti as CFString, 1, nil) else {
             return nil
         }
         let props: [CFString: Any] = [
             kCGImagePropertyMakerAppleDictionary: ["17": identifier],
-            kCGImageDestinationLossyCompressionQuality: quality
+            kCGImageDestinationLossyCompressionQuality: 0.92
         ]
         CGImageDestinationAddImage(dest, image, props as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
         return data as Data
+    }
+
+    /// 读回校验 MakerApple "17" 是否等于 identifier（key 可能是 String 或 NSNumber）
+    private static func hasIdentifier(_ data: Data, identifier: String) -> Bool {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let maker = props[kCGImagePropertyMakerAppleDictionary] as? [AnyHashable: Any] else {
+            return false
+        }
+        for (key, value) in maker {
+            let keyString = (key as? String) ?? (key as? NSNumber)?.stringValue ?? ""
+            if keyString == "17", let s = value as? String, s == identifier {
+                return true
+            }
+        }
+        return false
     }
 
     private static func tmpURL(_ name: String) -> URL {
