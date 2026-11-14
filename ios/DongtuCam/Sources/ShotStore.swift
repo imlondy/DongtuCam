@@ -28,6 +28,12 @@ final class ShotStore {
 
     private let root: URL
     private let queue = DispatchQueue(label: "dtc.shotstore")
+    /// 恢复流程是否在跑（只在主线程读写）。
+    ///
+    /// v19 的真机日志里出现过两次 `store.recover-1`，中间还夹着另一条
+    /// `save.still-failed` —— 说明 recover 被并发调用了两次，
+    /// 两条 PhotoKit 提交链同时在跑：既抢内存，也让「配对提交」更容易被拒。
+    private var recovering = false
 
     private init() {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
@@ -120,14 +126,25 @@ final class ShotStore {
 
     /// 冷启动 / 回到前台时调用。把没走完的素材补存进相册。
     /// - Parameter completion: 主线程回调；nil 表示没有待处理素材，否则是一句给用户看的结果
+    ///
+    /// **串行化**：同一时刻只允许一条恢复链。`onAppear` 与「回到前台」都可能触发，
+    /// 并发跑会同时向 PhotoKit 提两次配对请求（v19 现场就是这样），
+    /// 既有内存风险，也会让配对提交更容易被系统拒绝。
     func recover(completion: @escaping (String?) -> Void) {
-        let shots = pending()
-        guard !shots.isEmpty else {
-            DispatchQueue.main.async { completion(nil) }
-            return
+        DispatchQueue.main.async {
+            guard !self.recovering else {
+                completion(nil)
+                return
+            }
+            let shots = self.pending()
+            guard !shots.isEmpty else {
+                completion(nil)
+                return
+            }
+            self.recovering = true
+            Diagnostics.mark("store.recover-\(shots.count)")
+            self.recoverNext(Array(shots.prefix(3)), saved: 0, failed: 0, completion: completion)
         }
-        Diagnostics.mark("store.recover-\(shots.count)")
-        recoverNext(Array(shots.prefix(3)), saved: 0, failed: 0, completion: completion)
     }
 
     private func recoverNext(_ shots: [Shot], saved: Int, failed: Int,
@@ -142,7 +159,10 @@ final class ShotStore {
                 message = nil
             }
             Diagnostics.mark("store.recover-done")
-            DispatchQueue.main.async { completion(message) }
+            DispatchQueue.main.async {
+                self.recovering = false
+                completion(message)
+            }
             return
         }
         var rest = shots
