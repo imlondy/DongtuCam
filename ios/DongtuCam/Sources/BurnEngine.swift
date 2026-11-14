@@ -48,14 +48,26 @@ enum BurnEngine {
                                      CMTime(seconds: seconds, preferredTimescale: 600))
 
         // —— ① 烧字导出（不手动设 renderSize/frameDuration，避免抽帧崩溃）——
+        // 文字层只做「等比」缩放并顶部对齐。绝不能 X/Y 分开缩放：
+        // 一旦两轴比例不同，字会被横向拉宽、纵向压扁，看上去就是一坨黑块。
+        let context = sharedContext
         let composition = AVMutableVideoComposition(
             asset: asset,
             applyingCIFiltersWithHandler: { request in
                 let src = request.sourceImage
-                let sx = src.extent.width / max(1, textCI.extent.width)
-                let sy = src.extent.height / max(1, textCI.extent.height)
-                let fitted = textCI.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
-                request.finish(with: fitted.composited(over: src), context: nil)
+                let srcExtent = src.extent
+                let textExtent = textCI.extent
+                guard textExtent.width > 1, textExtent.height > 1,
+                      srcExtent.width > 1, srcExtent.height > 1 else {
+                    request.finish(with: src, context: nil)
+                    return
+                }
+                let scale = srcExtent.width / textExtent.width
+                var fitted = textCI.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                let dx = srcExtent.minX - fitted.extent.minX
+                let dy = srcExtent.maxY - fitted.extent.maxY
+                fitted = fitted.transformed(by: CGAffineTransform(translationX: dx, y: dy))
+                request.finish(with: fitted.composited(over: src), context: context)
             })
 
         // HEVC 优先（与 HEIC 静帧同编码族，新系统校验更容易过），失败自动退回 H.264
@@ -441,5 +453,21 @@ enum BurnEngine {
     private static func tmpURL(_ name: String) -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("dtc-\(UUID().uuidString)-\(name)")
+    }
+
+    /// 共用一个 CIContext，避免每帧新建上下文（内存与首帧延迟都会明显变差）
+    private static let sharedContext: CIContext = CIContext(options: [
+        .cacheIntermediates: false
+    ])
+
+    /// 从成片里取一帧（已按 preferredTransform 转正），用于拍完后兜底识别商品
+    static func previewFrame(from url: URL, at seconds: Double = 0.1) -> CGImage? {
+        let asset = AVAsset(url: url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .positiveInfinity
+        generator.requestedTimeToleranceAfter = .positiveInfinity
+        return try? generator.copyCGImage(at: CMTime(seconds: seconds, preferredTimescale: 600),
+                                          actualTime: nil)
     }
 }
