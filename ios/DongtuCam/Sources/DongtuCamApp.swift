@@ -62,9 +62,13 @@ struct ContentView: View {
     @State private var lastError: String?
     @State private var showSettings = false
     @State private var lastRecognition: Recognition?
+    /// 上一次崩在识别/抽帧这一步时，本次先跳过识别，保证能出片
+    @State private var recognitionDisabledThisRun = false
 
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
-    private let buildTag = "v12"
+    private let buildTag = "v13"
+    /// 预览文字的磅值（和下面 copyPreview 里的 13 保持一致）
+    private let previewFontPt: CGFloat = 13
 
     var body: some View {
         ZStack {
@@ -112,6 +116,25 @@ struct ContentView: View {
         // 上次是崩着退出的：把现场留在界面上，截图就能定位
         if let incident = Diagnostics.takeLastIncident() {
             lastError = "\(buildTag) 上次现场\n" + incident
+            // 自愈：连续崩就直接降级到「只出片」，不再碰识别与 AI。
+            // 宁可少一个功能，也不能让用户每次拍都闪退。
+            let fragile = ["copy.recognize", "process.frame", "process.text",
+                           "process.burn", "process.save", "camera.record"]
+            if fragile.contains(where: { incident.contains($0) }) {
+                let strikes = UserDefaults.standard.integer(forKey: "dtc.crash.strikes") + 1
+                UserDefaults.standard.set(strikes, forKey: "dtc.crash.strikes")
+                if strikes >= 2 {
+                    recognitionDisabledThisRun = true
+                    aiSettings.config.autoRecognize = false
+                    aiSettings.config.enabled = false
+                    statusText = "安全模式：已关闭识别与 AI，只用本地文案出片"
+                } else {
+                    recognitionDisabledThisRun = true
+                    statusText = "本次已跳过商品识别（上次崩在这一步）"
+                }
+            }
+        } else {
+            UserDefaults.standard.set(0, forKey: "dtc.crash.strikes")
         }
         Diagnostics.mark("app.ready")
     }
@@ -202,7 +225,7 @@ struct ContentView: View {
             ForEach(Array(previewLines.enumerated()), id: \.offset) { _, line in
                 if !line.isEmpty {
                     Text(line)
-                        .font(.system(size: 13, weight: .bold))
+                        .font(.system(size: previewFontPt, weight: .bold))
                         .foregroundStyle(.white)
                         .multilineTextAlignment(.center)
                         .shadow(color: .black.opacity(0.85), radius: 2.5)
@@ -297,13 +320,27 @@ struct ContentView: View {
 
     // MARK: 识别 + 写文案（从成片首帧取画面，避免多挂一路相机输出）
 
+    /// 是否真的需要识别。
+    ///
+    /// 这一条是**闪退的关键修复**：识别结果唯一的用途是「给 AI 提供输入 + 自动切商品」，
+    /// 而 AI 没配 Key 时文案本来就来自本地模板，识别纯属白跑——却要额外付出
+    /// Vision 模型装载（上百 MB）+ 一次全帧解码的代价。
+    /// v11/v12 就是在这条白跑的路径上被系统干掉的（内存顶峰 / Vision 异常）。
+    /// 所以现在只有 AI 真的可用、且用户没手动关掉时才识别。
+    private var recognitionNeeded: Bool {
+        guard !recognitionDisabledThisRun else { return false }
+        guard aiSettings.config.autoRecognize else { return false }
+        return aiSettings.isReady
+    }
+
     /// frame 为 nil 表示没取到画面，此时只走 AI（无图）/ 本地模板
     @MainActor
     private func prepareCopy(frame: CGImage?) async {
         var recognition: Recognition?
 
-        if let frame, aiSettings.config.autoRecognize {
+        if let frame, recognitionNeeded {
             statusText = "识别商品…"
+            Diagnostics.mark("copy.recognize")
             recognition = await ProductRecognizer.analyze(frame: frame,
                                                           products: copyEngine.products)
             lastRecognition = recognition
@@ -311,6 +348,7 @@ struct ContentView: View {
                 copyEngine.select(hit)
             }
             if let recognition { statusText = recognition.summary }
+            Diagnostics.mark("copy.recognized")
         }
 
         guard aiSettings.config.enabled,
@@ -326,6 +364,7 @@ struct ContentView: View {
         }
 
         statusText = "AI 写文案…"
+        Diagnostics.mark("copy.ai")
         var jpeg: Data?
         if aiSettings.config.useVision, let frame {
             jpeg = ProductRecognizer.jpegPreview(frame)
@@ -334,9 +373,45 @@ struct ContentView: View {
                                             recognition: recognition,
                                             imageJPEG: jpeg)
         if let note = copyEngine.note { statusText = note }
+        Diagnostics.mark("copy.ai-done")
     }
 
     // MARK: 烧字 + 写相册
+
+    /// 后台抽帧。AVAssetImageGenerator 是同步解码，放主线程会卡住 UI。
+    private static func frameInBackground(_ source: URL) async -> CGImage? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let image = autoreleasepool { BurnEngine.previewFrame(from: source) }
+                continuation.resume(returning: image)
+            }
+        }
+    }
+
+    /// 后台渲染文字层。UIGraphicsImageRenderer 支持在非主线程跑，
+    /// 大画布（上千万像素）放主线程会让界面卡住几百毫秒。
+    private static func overlayInBackground(lines: [String], size: CGSize,
+                                            previewFontPt: CGFloat,
+                                            screenWidth: CGFloat) async -> CGImage? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let image = autoreleasepool {
+                    TextLayer.make(lines: lines, size: size,
+                                   previewFontPt: previewFontPt,
+                                   screenWidthPt: screenWidth)
+                }
+                continuation.resume(returning: image)
+            }
+        }
+    }
+
+    /// 屏幕宽度（pt）。不用已废弃的 UIScreen.main。
+    @MainActor
+    private static var screenWidthPt: CGFloat {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        if let width = scenes.first?.screen.bounds.width, width > 0 { return width }
+        return 393
+    }
 
     private func process(_ source: URL) {
         Task { @MainActor in
@@ -344,12 +419,18 @@ struct ContentView: View {
             statusText = "整理文案…"
             Diagnostics.mark("process.begin")
 
+            // 抽帧放到后台：AVAssetImageGenerator 是同步解码，放主线程会卡 UI，
+            // 手指还在按屏幕时更容易被判「无响应」。
+            let wantFrame = recognitionNeeded
             var frame: CGImage?
-            if aiSettings.config.autoRecognize {
+            if wantFrame {
                 Diagnostics.mark("process.frame")
-                frame = BurnEngine.previewFrame(from: source)
+                frame = await Self.frameInBackground(source)
+                Diagnostics.mark(frame == nil ? "process.frame-nil" : "process.frame-ok")
             }
             await prepareCopy(frame: frame)
+            // 识别完立刻放掉，别让全尺寸帧一直占着内存
+            frame = nil
 
             if copyEngine.lines.isEmpty { copyEngine.regenerate() }
             Diagnostics.mark("process.copy")
@@ -363,7 +444,16 @@ struct ContentView: View {
             }
             let natural = track.naturalSize.applying(track.preferredTransform)
             let renderSize = CGSize(width: abs(natural.width), height: abs(natural.height))
-            guard let overlay = TextLayer.make(lines: copyEngine.lines, size: renderSize) else {
+
+            // 字号跟「拍摄时屏幕上看到的预览文字」对齐，只大 2 磅。
+            // 之前按画布宽 7.8% 取，粗了一倍多，成片里的字比预览大一大圈。
+            let screenWidth = Self.screenWidthPt
+            Diagnostics.mark("process.text")
+            let lines = copyEngine.lines
+            guard let overlay = await Self.overlayInBackground(lines: lines,
+                                                              size: renderSize,
+                                                              previewFontPt: previewFontPt,
+                                                              screenWidth: screenWidth) else {
                 phase = .failed("文案渲染失败")
                 statusText = "文案渲染失败，请先选商品"
                 lastError = "\(buildTag) 文案渲染失败 · size=\(Int(renderSize.width))x\(Int(renderSize.height))"
