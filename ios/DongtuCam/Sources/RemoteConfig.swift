@@ -19,7 +19,6 @@ import Foundation
 ///   "autoRecognize": true,
 ///   "useVision": false,
 ///   "autoGenerateOnShoot": true,
-///   "burnIntoVideo": true,
 ///   "note": "本周主推：陶瓷碗"
 /// }
 /// ```
@@ -35,7 +34,6 @@ struct RemoteAIConfig: Codable {
     var autoRecognize: Bool?
     var useVision: Bool?
     var autoGenerateOnShoot: Bool?
-    var burnIntoVideo: Bool?
     /// 后台附带的提示语（如「本周主推陶瓷碗」），会显示在预览区
     var note: String?
 }
