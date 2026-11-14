@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreImage
 import UIKit
+import ImageIO
 
 struct BurnOutput {
     let stillURL: URL
@@ -24,8 +25,15 @@ enum BurnEngineError: LocalizedError {
 }
 
 /// 把同一张文字图同时烧进「静帧」和「视频每一帧」。
-/// 这一步必须在 iPhone 本机做：只有本机产出的 still + pairedVideo
-/// 才能被 PHAssetCreationRequest 写成一个实况照片资源。
+///
+/// 关键：Live Photo 不是「一张 JPEG + 一个 MP4」，而是靠一个 assetIdentifier 把
+/// HEIC 静帧与 MOV 视频配对。iOS 15.1 起系统只会把这个标识写进 HEIC 的 MakerApple
+/// 元数据（不再写进 JPEG），否则 PHAssetCreationRequest 会直接报
+/// `PHPhotosErrorDomain 3302 (InvalidResource)` 而保存失败。
+///
+/// 因此这里：
+///   1. 视频导出时写入 com.apple.quicktime.content.identifier + still-image-time；
+///   2. 静帧存成 HEIC，并把同一个 identifier 写进 MakerApple 的 "17" 字段。
 enum BurnEngine {
     static func render(source: URL, overlay: CGImage, seconds: Double = 5.0,
                        completion: @escaping (Result<BurnOutput, Error>) -> Void) {
@@ -34,6 +42,9 @@ enum BurnEngine {
             completion(.failure(BurnEngineError.noVideoTrack))
             return
         }
+
+        // Live Photo 配对标识：HEIC 静帧与 MOV 视频必须共用同一个 UUID
+        let identifier = UUID().uuidString
 
         let textCI = CIImage(cgImage: overlay)
         // applyingCIFiltersWithHandler 会自动处理 preferredTransform（竖屏拍摄不会躺倒），
@@ -59,6 +70,7 @@ enum BurnEngine {
         exporter.outputFileType = .mov
         exporter.videoComposition = composition
         exporter.shouldOptimizeForNetworkUse = true
+        exporter.metadata = livePhotoMetadata(identifier: identifier)
         let limit = CMTime(seconds: seconds, preferredTimescale: 600)
         exporter.timeRange = CMTimeRange(start: .zero,
                                          duration: CMTimeMinimum(asset.duration, limit))
@@ -70,13 +82,30 @@ enum BurnEngine {
                 completion(.failure(BurnEngineError.exportFailed(reason)))
                 return
             }
-            completion(makeStill(asset: asset, textCI: textCI, videoURL: outVideo))
+            completion(makeStill(asset: asset, textCI: textCI,
+                                 videoURL: outVideo, identifier: identifier))
         }
     }
 
+    /// 视频侧配对元数据：content identifier + still-image-time
+    private static func livePhotoMetadata(identifier: String) -> [AVMetadataItem] {
+        let contentID = AVMutableMetadataItem()
+        contentID.keySpace = .quickTimeMetadata
+        contentID.key = "com.apple.quicktime.content.identifier" as NSString
+        contentID.value = identifier as NSString
+
+        let stillTime = AVMutableMetadataItem()
+        stillTime.keySpace = .quickTimeMetadata
+        stillTime.key = "com.apple.quicktime.still-image-time" as NSString
+        stillTime.value = 0 as NSNumber
+
+        return [contentID, stillTime]
+    }
+
     /// still 必须也带文字，否则长按实况时文字会「闪现一下再消失」。
+    /// 并且必须存成 HEIC，写入 MakerApple 的 "17" 配对标识。
     private static func makeStill(asset: AVAsset, textCI: CIImage,
-                                  videoURL: URL) -> Result<BurnOutput, Error> {
+                                  videoURL: URL, identifier: String) -> Result<BurnOutput, Error> {
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.requestedTimeToleranceBefore = .zero
@@ -90,15 +119,31 @@ enum BurnEngine {
             let fitted = textCI.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
             let merged = fitted.composited(over: stillCI)
             guard let out = CIContext().createCGImage(merged, from: merged.extent),
-                  let jpeg = UIImage(cgImage: out).jpegData(compressionQuality: 0.95) else {
+                  let heic = heicData(from: out, identifier: identifier, quality: 0.9) else {
                 return .failure(BurnEngineError.stillFailed)
             }
-            let outStill = tmpURL("still.jpg")
-            try jpeg.write(to: outStill)
+            let outStill = tmpURL("still.heic")
+            try heic.write(to: outStill)
             return .success(BurnOutput(stillURL: outStill, videoURL: videoURL))
         } catch {
             return .failure(error)
         }
+    }
+
+    /// 编码 HEIC，并把 Live Photo 配对标识写进 MakerApple 元数据（"17" 字段）
+    private static func heicData(from image: CGImage, identifier: String, quality: CGFloat) -> Data? {
+        let data = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(data as CFMutableData,
+                                                          "public.heic" as CFString, 1, nil) else {
+            return nil
+        }
+        let props: [CFString: Any] = [
+            kCGImagePropertyMakerAppleDictionary: ["17": identifier],
+            kCGImageDestinationLossyCompressionQuality: quality
+        ]
+        CGImageDestinationAddImage(dest, image, props as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return data as Data
     }
 
     private static func tmpURL(_ name: String) -> URL {
