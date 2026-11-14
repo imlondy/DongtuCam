@@ -24,9 +24,12 @@ enum TextLayer {
     /// 单次渲染的最大行数（再多会把字号压到看不清）
     private static let maxLines = 5
     /// 描边宽度占字号的比例
-    private static let strokeRatio: CGFloat = 0.026
-    /// 投影模糊半径占字号的比例（v17 收窄：投影一糊，小字号就发毛）
-    private static let shadowRatio: CGFloat = 0.04
+    private static let strokeRatio: CGFloat = 0.024
+    /// 投影模糊半径占字号的比例。
+    /// v19 归零：任何模糊都会在小字号下把字边缘"拖"开一圈灰边，
+    /// 真机上看起来就是"字发糊"。改成硬投影（只偏移、不模糊）后，
+    /// 字与背景的分离度靠描边保证，边缘保持锐利。
+    private static let shadowBlurRatio: CGFloat = 0
 
     /// - Parameters:
     ///   - size: 成片画布尺寸（视频显示尺寸）
@@ -68,9 +71,11 @@ enum TextLayer {
 
         let maxWidth = w * 0.90
         let maxBlockHeight = h * 0.42
-        // 兜底上下限：再小看不清（v18 抬高了下限），再大就会盖住商品
+        // 兜底上下限：再小看不清，再大就会盖住商品
+        // 1080 宽画布下 0.036 ≈ 39px —— 正常排版不会被它触发，
+        // 只用来挡住「文案超长时把字号一路压到看不清」这种极端情况
         let upperBound = min(target, w * 0.085)
-        let lowerBound = max(14, w * 0.034)
+        let lowerBound = max(16, w * 0.036)
 
         var fontSize = upperBound
         var lineHeight = fontSize * lineSpacing
@@ -117,9 +122,9 @@ enum TextLayer {
         let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
 
         let shadow = NSShadow()
-        shadow.shadowColor = UIColor(white: 0, alpha: 0.42)
-        shadow.shadowBlurRadius = max(1, fontSize * shadowRatio)
-        shadow.shadowOffset = CGSize(width: 0, height: max(1, fontSize * 0.016))
+        shadow.shadowColor = UIColor(white: 0, alpha: 0.5)
+        shadow.shadowBlurRadius = fontSize * shadowBlurRatio
+        shadow.shadowOffset = CGSize(width: 0, height: max(1, fontSize * 0.02))
 
         let strokeWidth = -max(0.8, fontSize * strokeRatio)
 
