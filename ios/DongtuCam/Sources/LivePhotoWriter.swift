@@ -82,8 +82,10 @@ enum LivePhotoWriter {
     /// 实况配对失败时的兜底：至少把「带字的那张 HEIC」存成普通照片，
     /// 让用户这一拍不完全白费（界面上会写明实况没配上）。
     static func saveStill(_ still: URL, completion: @escaping (Result<Void, Error>) -> Void) {
+        Diagnostics.mark("save.still-begin")
         authorize(addOnly: true) { allowed in
             guard allowed else {
+                Diagnostics.mark("save.still-denied")
                 completion(.failure(LivePhotoWriterError.denied))
                 return
             }
@@ -93,6 +95,7 @@ enum LivePhotoWriter {
                 options.originalFilename = "DTC_TEXT.HEIC"
                 creation.addResource(with: .photo, fileURL: still, options: options)
             } completionHandler: { success, error in
+                Diagnostics.mark(success ? "save.still-ok" : "save.still-failed")
                 DispatchQueue.main.async {
                     if success {
                         completion(.success(()))
@@ -113,12 +116,15 @@ enum LivePhotoWriter {
     /// 只要原片还在，至少能让用户拿到一段视频（用户对 v13 的印象就是
     /// 「闪退但相册里有视频」，说明这个兜底是有价值的）。
     static func saveVideo(_ video: URL, completion: @escaping (Result<Void, Error>) -> Void) {
+        Diagnostics.mark("save.video-begin")
         guard FileManager.default.fileExists(atPath: video.path) else {
+            Diagnostics.mark("save.video-missing")
             completion(.failure(LivePhotoWriterError.failed("视频文件不存在")))
             return
         }
         authorize(addOnly: true) { allowed in
             guard allowed else {
+                Diagnostics.mark("save.video-denied")
                 completion(.failure(LivePhotoWriterError.denied))
                 return
             }
@@ -130,6 +136,7 @@ enum LivePhotoWriter {
                 options.shouldMoveFile = false
                 creation.addResource(with: .video, fileURL: video, options: options)
             } completionHandler: { success, error in
+                Diagnostics.mark(success ? "save.video-ok" : "save.video-failed")
                 DispatchQueue.main.async {
                     if success {
                         completion(.success(()))
@@ -195,14 +202,18 @@ enum LivePhotoWriter {
 
     private static func preflight(still: URL, video: URL,
                                   done: @escaping (String) -> Void) {
+        Diagnostics.mark("save.preflight")
         PHLivePhoto.request(withResourceFileURLs: [still, video],
                             placeholderImage: nil,
-                            targetSize: .zero,
+                            // 别用 .zero：那会按全尺寸解码整套实况，内存峰值陡增；
+                            // 配对校验只需要小图
+                            targetSize: CGSize(width: 320, height: 428),
                             contentMode: .aspectFit) { photo, info in
             var note = photo != nil ? "pair=ok" : "pair=nil"
             if photo == nil, let error = info[PHLivePhotoInfoErrorKey] as? NSError {
                 note += "(\(error.code))"
             }
+            Diagnostics.mark("save.preflight-\(photo != nil ? "ok" : "nil")")
             DispatchQueue.main.async { done(note) }
         }
     }
@@ -213,6 +224,7 @@ enum LivePhotoWriter {
                                videoURL: URL, context: String,
                                completion: @escaping (Result<Void, Error>) -> Void) {
         let sizeMB = Double(videoData.count) / 1024.0 / 1024.0
+        Diagnostics.mark("save.commit-\(mode.rawValue)")
         PHPhotoLibrary.shared().performChanges {
             let creation = PHAssetCreationRequest.forAsset()
 
