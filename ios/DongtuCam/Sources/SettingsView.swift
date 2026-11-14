@@ -19,6 +19,7 @@ struct AISettingsView: View {
         NavigationStack {
             Form {
                 backendSection
+                detectSection
                 effectiveSection
                 testSection
                 skillSection
@@ -71,6 +72,22 @@ struct AISettingsView: View {
             AI 的接口地址、Key、模型、识别开关都在后台改，App 里不再填。
             这里只填「配置地址」，点同步即可生效；拍之前会自动同步一次。
             拿不到配置不影响出片：AI 关闭，改用本地模板文案。
+            """)
+        }
+    }
+
+    // MARK: 自动识别
+
+    private var detectSection: some View {
+        Section {
+            Toggle("举起商品自动识别并出文案", isOn: $settings.autoDetectOnCamera)
+        } header: {
+            Text("自动识别")
+        } footer: {
+            Text("""
+            打开后，在相机里把商品对准画面停 2~3 秒，App 会自动判断是哪个商品，\
+            并让 AI 写一条新文案（没配 AI 就换本地模板文案）。
+            同一款商品不会重复请求 AI，换成另一款才会再次生成。
             """)
         }
     }
