@@ -106,12 +106,18 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
     /// 现在强制要求媒体子类型是视频编码（420v/420f/x420）。
     private static func selectThreeFourFormat(on device: AVCaptureDevice) {
         let videoSubTypes: Set<FourCharCode> = [0x34323076, 0x34323066, 0x78343230]
+        /// 8bit 的两种（420v / 420f）；`x420` 是 10bit HDR，静帧是 SDR，
+        /// 混着来容易出现「视频 HDR、照片 SDR」的色偏，所以优先 8bit。
+        let eightBitSubTypes: Set<FourCharCode> = [0x34323076, 0x34323066]
 
         func dimension(_ format: AVCaptureDevice.Format) -> CMVideoDimensions {
             CMVideoFormatDescriptionGetDimensions(format.formatDescription)
         }
+        func subType(_ format: AVCaptureDevice.Format) -> FourCharCode {
+            CMFormatDescriptionGetMediaSubType(format.formatDescription)
+        }
         func isVideo(_ format: AVCaptureDevice.Format) -> Bool {
-            videoSubTypes.contains(CMFormatDescriptionGetMediaSubType(format.formatDescription))
+            videoSubTypes.contains(subType(format))
         }
         func area(_ format: AVCaptureDevice.Format) -> Int {
             let d = dimension(format)
@@ -122,8 +128,10 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
             return min(Int(d.width), Int(d.height))
         }
 
-        let videoFormats = device.formats.filter(isVideo)
-        guard !videoFormats.isEmpty else { return }
+        let allVideoFormats = device.formats.filter(isVideo)
+        guard !allVideoFormats.isEmpty else { return }
+        let eightBitFormats = allVideoFormats.filter { eightBitSubTypes.contains(subType($0)) }
+        let videoFormats = eightBitFormats.isEmpty ? allVideoFormats : eightBitFormats
 
         let portrait: CGFloat = 3.0 / 4.0
         let landscape: CGFloat = 4.0 / 3.0
