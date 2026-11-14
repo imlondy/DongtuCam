@@ -31,28 +31,56 @@ struct Recognition {
 /// 纯本机识别：Vision 做文字识别 + 图像分类，再用商品库的关键词打分。
 /// 不联网、不花钱，识别结果同时作为 AI 的输入。
 enum ProductRecognizer {
+    /// Vision 与图像缩放都放后台线程，且整段包在 autoreleasepool 里，
+    /// 避免 4K 图反复识别时内存越堆越高（前台被系统杀掉就是「闪退」）。
     static func analyze(frame: CGImage, products: [Product]) async -> Recognition {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 var result = Recognition()
-
-                // 相机缓冲区是传感器朝向（横向），生成图有时是竖向，
-                // 两种都试一遍、取文字更多的那个，避免识别率被朝向拖死。
-                var best: [String] = []
-                for orientation in [CGImagePropertyOrientation.right, .up] {
-                    let lines = ocr(frame, orientation: orientation)
-                    if lines.joined().count > best.joined().count { best = lines }
+                autoreleasepool {
+                    result = analyzeSync(frame: frame, products: products)
                 }
-                result.ocrLines = best
-                result.labels = classify(frame)
-
-                let match = localMatch(result, products: products)
-                result.localHit = match.product
-                result.localScore = match.score
-
                 continuation.resume(returning: result)
             }
         }
+    }
+
+    private static func analyzeSync(frame: CGImage, products: [Product]) -> Recognition {
+        var result = Recognition()
+        // 识别不需要原图那么大：长边 1280 足够 OCR 与分类，速度和内存都稳得多
+        let small = downscale(frame, maxSide: 1280)
+
+        // 相机缓冲区是传感器朝向（横向），生成图有时是竖向，
+        // 两种都试一遍、取文字更多的那个，避免识别率被朝向拖死。
+        var best: [String] = []
+        for orientation in [CGImagePropertyOrientation.right, .up] {
+            let lines = ocr(small, orientation: orientation)
+            if lines.joined().count > best.joined().count { best = lines }
+        }
+        result.ocrLines = best
+        result.labels = classify(small)
+
+        let match = localMatch(result, products: products)
+        result.localHit = match.product
+        result.localScore = match.score
+        return result
+    }
+
+    /// 长边缩到 maxSide；本来就小就原样返回
+    private static func downscale(_ image: CGImage, maxSide: CGFloat) -> CGImage {
+        let w = CGFloat(image.width)
+        let h = CGFloat(image.height)
+        guard w > 1, h > 1, max(w, h) > maxSide else { return image }
+        let scale = maxSide / max(w, h)
+        let target = CGSize(width: max(1, (w * scale).rounded()),
+                            height: max(1, (h * scale).rounded()))
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let rendered = UIGraphicsImageRenderer(size: target, format: format).image { _ in
+            UIImage(cgImage: image).draw(in: CGRect(origin: .zero, size: target))
+        }
+        return rendered.cgImage ?? image
     }
 
     /// 给多模态模型用的缩略图（768 长边、JPEG 0.6，约 60~100KB）
@@ -74,6 +102,16 @@ enum ProductRecognizer {
 
     // MARK: - Vision
 
+    /// 只使用系统确实支持的语言。给 VNRecognizeTextRequest 塞入不支持的语言时，
+    /// 系统抛的是 ObjC 异常（Swift 的 try 接不住），会直接闪退，所以必须先查支持列表。
+    private static let textLanguages: [String] = {
+        let wanted = ["zh-Hans", "zh-Hant", "en-US"]
+        let supported = (try? VNRecognizeTextRequest.supportedRecognitionLanguages(
+            for: .accurate, revision: VNRecognizeTextRequestRevision3)) ?? []
+        guard !supported.isEmpty else { return wanted }
+        return wanted.filter { supported.contains($0) }
+    }()
+
     private static func ocr(_ image: CGImage, orientation: CGImagePropertyOrientation) -> [String] {
         func run(_ languages: [String]) -> [String]? {
             let request = VNRecognizeTextRequest()
@@ -91,7 +129,8 @@ enum ProductRecognizer {
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { $0.count >= 2 }
         }
-        if let lines = run(["zh-Hans", "en-US"]) { return lines }
+        if let lines = run(textLanguages) { return lines }
+        // 语言列表被系统拒绝时退回「不指定语言」
         return run([]) ?? []
     }
 
