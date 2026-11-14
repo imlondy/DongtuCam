@@ -18,6 +18,8 @@ enum LivePhotoWriterError: LocalizedError {
 struct LivePhotoOutcome {
     /// true = 回读确认是实况；false = 存成了普通照片；nil = 没权限回读，无法确认
     let verifiedLive: Bool?
+    /// 刚存进相册那张的 PHAsset 标识符（v23 起用于左下角缩略图与预览）
+    let localIdentifier: String?
 }
 
 /// 把「带文字的 HEIC 静帧 + 配好元数据的 MOV」交给 PhotoKit 配成一张实况照片。
@@ -130,7 +132,8 @@ enum LivePhotoWriter {
                 }
                 Diagnostics.markMem(isLive == true ? "save.live-ok" : "save.ok-unverified")
                 DispatchQueue.main.async {
-                    completion(.success(LivePhotoOutcome(verifiedLive: isLive)))
+                    completion(.success(LivePhotoOutcome(verifiedLive: isLive,
+                                                         localIdentifier: created)))
                 }
                 return
             }
