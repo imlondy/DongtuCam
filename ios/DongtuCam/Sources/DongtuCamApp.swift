@@ -4,6 +4,10 @@ import UIKit
 
 @main
 struct DongtuCamApp: App {
+    init() {
+        Diagnostics.installCrashHandler()
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -31,7 +35,7 @@ final class PreviewUIView: UIView {
 
     var videoPreviewLayer: AVCaptureVideoPreviewLayer {
         guard let layer = layer as? AVCaptureVideoPreviewLayer else {
-            fatalError("PreviewUIView 的 layer 必须是 AVCaptureVideoPreviewLayer")
+            return AVCaptureVideoPreviewLayer()
         }
         return layer
     }
@@ -57,13 +61,10 @@ struct ContentView: View {
     @State private var statusText = "选好商品 → 点快门拍 5 秒 → 自动出片"
     @State private var lastError: String?
     @State private var showSettings = false
-
-    /// 录制期间并行跑的「识别 + 写文案」任务
-    @State private var copyJob: Task<Void, Never>?
     @State private var lastRecognition: Recognition?
 
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
-    private let buildTag = "v11"
+    private let buildTag = "v12"
 
     var body: some View {
         ZStack {
@@ -99,11 +100,20 @@ struct ContentView: View {
                 shutter
             }
         }
-        .onAppear(perform: askPermission)
+        .onAppear(perform: onAppear)
         .onDisappear(perform: camera.stop)
         .sheet(isPresented: $showSettings) {
             AISettingsView(settings: aiSettings, copyEngine: copyEngine)
         }
+    }
+
+    private func onAppear() {
+        askPermission()
+        // 上次是崩着退出的：把现场留在界面上，截图就能定位
+        if let incident = Diagnostics.takeLastIncident() {
+            lastError = "\(buildTag) 上次现场\n" + incident
+        }
+        Diagnostics.mark("app.ready")
     }
 
     // MARK: 顶部：商品 + 文案操作 + 设置
@@ -163,6 +173,14 @@ struct ContentView: View {
             .background(.ultraThinMaterial, in: Circle())
     }
 
+    /// 固定 3 个位置、用「新建的数组」渲染。
+    /// 不能用 ForEach(lines.indices, id: \.self)：AI 返回行数变化时
+    /// SwiftUI 会拿旧索引去取新数组，是典型的越界闪退来源。
+    private var previewLines: [String] {
+        let source = copyEngine.lines
+        return (0..<3).map { index in index < source.count ? source[index] : "" }
+    }
+
     /// 只是拍前预览，不会进画面；真正烧录由 TextLayer 完成
     private var copyPreview: some View {
         VStack(spacing: 3) {
@@ -181,12 +199,14 @@ struct ContentView: View {
                 }
             }
 
-            ForEach(copyEngine.lines.indices, id: \.self) { index in
-                Text(copyEngine.lines[index])
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(.white)
-                    .multilineTextAlignment(.center)
-                    .shadow(color: .black.opacity(0.85), radius: 2.5)
+            ForEach(Array(previewLines.enumerated()), id: \.offset) { _, line in
+                if !line.isEmpty {
+                    Text(line)
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.center)
+                        .shadow(color: .black.opacity(0.85), radius: 2.5)
+                }
             }
 
             if let note = copyEngine.note {
@@ -259,31 +279,25 @@ struct ContentView: View {
         phase = .recording
         lastError = nil
         lastRecognition = nil
-        statusText = aiSettings.config.autoRecognize
-            ? "录制中 · 同时识别画面、写文案…"
-            : "录制 5 秒…"
-
-        // 按下快门立刻抓一帧，识别和写文案在录制这 5 秒里并行跑完
-        copyJob = Task { @MainActor in
-            let frame = await camera.snapshot()
-            await prepareCopy(frame: frame)
-        }
+        statusText = "录制 5 秒…"
+        Diagnostics.mark("shutter")
 
         camera.capture(seconds: 5.0) { result in
             switch result {
             case .failure(let error):
                 self.phase = .failed(error.localizedDescription)
-                self.lastError = "录制失败\n" + error.localizedDescription
-                self.statusText = "录制失败：\(error.localizedDescription)"
+                self.lastError = "\(buildTag) 录制失败\n" + error.localizedDescription
+                self.statusText = "录制失败（详情见下方）"
+                Diagnostics.clear()
             case .success(let url):
                 self.process(url)
             }
         }
     }
 
-    // MARK: 识别 + 写文案
+    // MARK: 识别 + 写文案（从成片首帧取画面，避免多挂一路相机输出）
 
-    /// frame 为 nil 表示没抓到画面，此时只走 AI（无图）/ 本地模板
+    /// frame 为 nil 表示没取到画面，此时只走 AI（无图）/ 本地模板
     @MainActor
     private func prepareCopy(frame: CGImage?) async {
         var recognition: Recognition?
@@ -291,7 +305,7 @@ struct ContentView: View {
         if let frame, aiSettings.config.autoRecognize {
             statusText = "识别商品…"
             recognition = await ProductRecognizer.analyze(frame: frame,
-                                                           products: copyEngine.products)
+                                                          products: copyEngine.products)
             lastRecognition = recognition
             if let hit = recognition?.localHit {
                 copyEngine.select(hit)
@@ -328,22 +342,23 @@ struct ContentView: View {
         Task { @MainActor in
             phase = .processing
             statusText = "整理文案…"
+            Diagnostics.mark("process.begin")
 
-            // 等录制期间那条并行任务收尾
-            await copyJob?.value
-            copyJob = nil
-
-            // 快门那一刻没抓到画面时，退化成从成片首帧识别
-            if lastRecognition == nil, aiSettings.config.autoRecognize,
-               let frame = BurnEngine.previewFrame(from: source) {
-                await prepareCopy(frame: frame)
+            var frame: CGImage?
+            if aiSettings.config.autoRecognize {
+                Diagnostics.mark("process.frame")
+                frame = BurnEngine.previewFrame(from: source)
             }
+            await prepareCopy(frame: frame)
 
             if copyEngine.lines.isEmpty { copyEngine.regenerate() }
+            Diagnostics.mark("process.copy")
 
             guard let track = AVAsset(url: source).tracks(withMediaType: .video).first else {
                 phase = .failed("没有视频轨")
                 statusText = "素材里没有视频轨"
+                lastError = "\(buildTag) 素材里没有视频轨"
+                Diagnostics.clear()
                 return
             }
             let natural = track.naturalSize.applying(track.preferredTransform)
@@ -351,10 +366,13 @@ struct ContentView: View {
             guard let overlay = TextLayer.make(lines: copyEngine.lines, size: renderSize) else {
                 phase = .failed("文案渲染失败")
                 statusText = "文案渲染失败，请先选商品"
+                lastError = "\(buildTag) 文案渲染失败 · size=\(Int(renderSize.width))x\(Int(renderSize.height))"
+                Diagnostics.clear()
                 return
             }
 
             statusText = "烧录字幕 → 写入相册…"
+            Diagnostics.mark("process.burn")
             do {
                 let output = try await withCheckedThrowingContinuation {
                     (continuation: CheckedContinuation<BurnOutput, Error>) in
@@ -362,6 +380,7 @@ struct ContentView: View {
                         continuation.resume(with: result)
                     }
                 }
+                Diagnostics.mark("process.save")
                 statusText = "写入相册…"
                 try await withCheckedThrowingContinuation {
                     (continuation: CheckedContinuation<Void, Error>) in
@@ -374,10 +393,12 @@ struct ContentView: View {
                 phase = .done
                 lastError = nil
                 statusText = "已存入相册 · 抖音「+ → 相册 → 动图」直接发"
+                Diagnostics.clear()
             } catch {
                 phase = .failed(error.localizedDescription)
                 lastError = "\(buildTag) 失败\n" + error.localizedDescription
                 statusText = "处理失败（详情见下方）"
+                Diagnostics.clear()
             }
         }
     }
