@@ -14,14 +14,12 @@ struct AISettingsView: View {
     @State private var testing = false
     @State private var testResult: String?
     @State private var testOK = false
-    @AppStorage("dtc.burn.into.video") private var burnIntoVideo = true
 
     var body: some View {
         NavigationStack {
             Form {
                 backendSection
                 effectiveSection
-                outputSection
                 testSection
                 skillSection
                 productsSection
@@ -113,24 +111,6 @@ struct AISettingsView: View {
                 .foregroundStyle(ok == nil ? Color.secondary : (ok! ? Color.green : Color.orange))
                 .lineLimit(1)
                 .truncationMode(.middle)
-        }
-    }
-
-    // MARK: 输出
-
-    private var outputSection: some View {
-        Section {
-            Toggle("文案也压进动图", isOn: $burnIntoVideo)
-        } header: {
-            Text("输出")
-        } footer: {
-            Text("""
-            开启：动图播放时也能看到文案，文字每帧贴在同一位置（钉住不晃）。
-            · 封面永远用原始首帧 1:1 合成，文字最清晰
-            · 动图里的字要重编码一次视频，画质有一次性轻微压缩
-            · 多花 1~3 秒；失败会自动退回「字只在照片上」，不会白拍
-            关闭：最快，只有照片带字
-            """)
         }
     }
 
