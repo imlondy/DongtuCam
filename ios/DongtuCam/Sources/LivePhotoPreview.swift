@@ -159,9 +159,15 @@ struct LivePhotoPreviewSheet: View {
             status = "相册里没找到这一张，请在「照片」里确认"
             return
         }
-        _ = PHLivePhoto.request(for: asset,
-                                targetSize: CGSize(width: 900, height: 1200),
-                                contentMode: .aspectFit) { photo, _ in
+        // 从相册回读实况要用 PHImageManager（PHLivePhoto 自己的 request 只接受文件 URL）
+        let options = PHLivePhotoRequestOptions()
+        options.deliveryMode = .highQualityFormat
+        options.isNetworkAccessAllowed = false
+
+        _ = PHImageManager.default().requestLivePhoto(for: asset,
+                                                     targetSize: CGSize(width: 900, height: 1200),
+                                                     contentMode: .aspectFit,
+                                                     options: options) { photo, _ in
             DispatchQueue.main.async {
                 if let photo {
                     livePhoto = photo
