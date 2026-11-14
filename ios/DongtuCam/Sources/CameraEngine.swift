@@ -33,8 +33,41 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
     let session = AVCaptureSession()
     private let movieOutput = AVCaptureMovieFileOutput()
     private let sessionQueue = DispatchQueue(label: "dtc.camera.session")
-    private var onFinish: ((Result<URL, Error>) -> Void)?
     private var configured = false
+
+    /// 跨线程共享的标记位与回调统一用一把锁保护。
+    ///
+    /// Swift 的闭包是「函数指针 + 上下文指针」两个字宽，主线程写、相机队列读
+    /// 如果不加锁，有概率读到撕裂的值。这类崩溃位置随机、极难复现，
+    /// 必须在写的时候就堵住，而不是等它出现在现场日志里。
+    private let stateLock = NSLock()
+    private var finishHandler: ((Result<URL, Error>) -> Void)?
+    private var onFinish: ((Result<URL, Error>) -> Void)? {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return finishHandler
+        }
+        set {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            finishHandler = newValue
+        }
+    }
+    /// 录制中不送帧：识别没必要时时跑，也别和录制抢 CPU
+    private var samplingFlag = true
+    private var samplingEnabled: Bool {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return samplingFlag
+        }
+        set {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            samplingFlag = newValue
+        }
+    }
 
     /// 保留设备引用，美化调节与变焦都要用它
     private var videoDevice: AVCaptureDevice?
@@ -42,8 +75,6 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
     private let frameOutput = AVCaptureVideoDataOutput()
     private let frameQueue = DispatchQueue(label: "dtc.camera.frames")
     private var lastSampleAt: CFTimeInterval = 0
-    /// 录制中不送帧：识别没必要时时跑，也别和录制抢 CPU
-    private var samplingEnabled = true
 
     /// 送帧回调（主线程调用）。
     ///
@@ -261,78 +292,162 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
     //      不会出现「封面和动图颜色不一致」这种穿帮；
     //   3. 零额外内存、零额外编码，不给已经很脆的保存链路添风险。
 
+    /// 滑杆拖动每秒会产生上百次回调。如果每次都直接排队下发，
+    /// 就是上百次 `lockForConfiguration` —— 又慢又容易和录制/切换格式撞车。
+    /// 这三个「只保留最新值」的槽位把一次拖动压缩成几次实际应用，手感也更顺。
+    private let exposureQueue = LatestValue<Float>()
+    private let zoomQueue = LatestValue<CGFloat>()
+    private let kelvinQueue = LatestValue<CGFloat>()
+
+    /// 三项调节的唯一出口。
+    ///
+    /// v23 的崩溃就出在这里：亮度直接调了 `setExposureTargetBias` 而没先锁定设备，
+    /// AVFoundation 抛出 ObjC 异常 ——
+    /// `May not be called without first successfully gaining exclusive ownership
+    /// of the device using -lockForConfiguration:` —— 这种异常 Swift 的 `try` 抓不到，
+    /// 进程当场被信号带走。现在所有设备参数修改都必须经过这里。
+    ///
+    /// 另外，`unlockForConfiguration` 放在 `defer` 里：一旦漏了解锁，
+    /// 设备会被永久占住，之后所有调节都静默失败 —— 比崩溃更难查。
+    @discardableResult
+    private func withDeviceConfig(_ tag: String, _ body: (AVCaptureDevice) throws -> Void) -> Bool {
+        guard let device = videoDevice else {
+            Diagnostics.mark("camera.\(tag)-nodevice")
+            return false
+        }
+        do {
+            try device.lockForConfiguration()
+        } catch {
+            // 正常不会走到：sessionQueue 是串行的，且所有写入都经由它。
+            Diagnostics.mark("camera.\(tag)-lockfail")
+            return false
+        }
+        defer { device.unlockForConfiguration() }
+        do {
+            try body(device)
+            return true
+        } catch {
+            Diagnostics.mark("camera.\(tag)-failed")
+            return false
+        }
+    }
+
     /// 亮度 = 曝光补偿（EV）。范围跟设备走，一般是 ±2。
     func setExposureBias(_ value: Float) {
-        sessionQueue.async { [weak self] in
-            guard let self, let device = self.videoDevice else { return }
-            let clamped = max(device.minExposureTargetBias,
-                              min(device.maxExposureTargetBias, value))
-            device.setExposureTargetBias(clamped)
-            DispatchQueue.main.async { self.exposureBias = clamped }
+        let clamped = max(exposureRange.lowerBound, min(exposureRange.upperBound, value))
+        // 先乐观更新，滑杆才跟手；真正是否生效由相机队列确认
+        publish { self.exposureBias = clamped }
+        if exposureQueue.push(clamped) {
+            drainExposure()
         }
+    }
+
+    private func drainExposure() {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            let next = self.exposureQueue.drain()
+            if let value = next { self.applyExposure(value) }
+            // 应用期间可能又来了新值，继续下一轮；没新值就自然收尾
+            if !self.exposureQueue.isIdle { self.drainExposure() }
+        }
+    }
+
+    private func applyExposure(_ value: Float) {
+        guard let device = videoDevice else { return }
+        let clamped = max(device.minExposureTargetBias,
+                          min(device.maxExposureTargetBias, value))
+        guard withDeviceConfig("exposure") { dev in
+            dev.setExposureTargetBias(clamped)
+        } else { return }
+        publish { if self.exposureBias != clamped { self.exposureBias = clamped } }
     }
 
     /// 变焦。上限取设备能力与 6 倍的较小值（再高就只是糊的数码放大）。
     func setZoom(_ value: CGFloat) {
-        sessionQueue.async { [weak self] in
-            guard let self, let device = self.videoDevice else { return }
-            let ceiling = min(device.maxAvailableVideoZoomFactor, 6)
-            let clamped = max(1, min(ceiling, value))
-            do {
-                try device.lockForConfiguration()
-                device.videoZoomFactor = clamped
-                device.unlockForConfiguration()
-                DispatchQueue.main.async { self.zoomFactor = clamped }
-            } catch {
-                Diagnostics.mark("camera.zoom-failed")
-            }
+        publish { self.zoomFactor = value }
+        if zoomQueue.push(value) {
+            drainZoom()
         }
+    }
+
+    private func drainZoom() {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            let next = self.zoomQueue.drain()
+            if let value = next { self.applyZoom(value) }
+            if !self.zoomQueue.isIdle { self.drainZoom() }
+        }
+    }
+
+    private func applyZoom(_ value: CGFloat) {
+        guard let device = videoDevice else { return }
+        let ceiling = max(1, min(device.maxAvailableVideoZoomFactor, 6))
+        let clamped = max(1, min(ceiling, value))
+        guard withDeviceConfig("zoom") { dev in
+            dev.videoZoomFactor = clamped
+        } else { return }
+        publish { if self.zoomFactor != clamped { self.zoomFactor = clamped } }
     }
 
     /// 色温 = 锁定白平衡。数值越小越冷（偏蓝），越大越暖（偏黄）。
     func setKelvin(_ value: CGFloat) {
+        let clamped = max(3000, min(8000, value))
+        publish {
+            self.kelvin = clamped
+            self.autoWhiteBalance = false
+        }
+        if kelvinQueue.push(clamped) {
+            drainKelvin()
+        }
+    }
+
+    private func drainKelvin() {
         sessionQueue.async { [weak self] in
-            guard let self, let device = self.videoDevice else { return }
-            guard device.isWhiteBalanceModeSupported(.locked) else { return }
-            let clamped = max(3000, min(8000, value))
-            do {
-                try device.lockForConfiguration()
-                let target = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
-                    temperature: Float(clamped), tint: 0)
-                let gains = device.deviceWhiteBalanceGains(for: target)
-                let ceiling = device.maxWhiteBalanceGain
-                func safe(_ v: Float) -> Float { max(1, min(ceiling, v)) }
-                device.setWhiteBalanceModeLocked(
-                    with: AVCaptureDevice.WhiteBalanceGains(redGain: safe(gains.redGain),
-                                                            greenGain: safe(gains.greenGain),
-                                                            blueGain: safe(gains.blueGain)))
-                device.unlockForConfiguration()
-                DispatchQueue.main.async {
-                    self.kelvin = clamped
-                    self.autoWhiteBalance = false
-                }
-            } catch {
-                Diagnostics.mark("camera.wb-failed")
-            }
+            guard let self else { return }
+            let next = self.kelvinQueue.drain()
+            if let value = next { self.applyKelvin(value) }
+            if !self.kelvinQueue.isIdle { self.drainKelvin() }
+        }
+    }
+
+    private func applyKelvin(_ value: CGFloat) {
+        guard let device = videoDevice else { return }
+        guard device.isWhiteBalanceModeSupported(.locked) else {
+            Diagnostics.mark("camera.wb-unsupported")
+            return
+        }
+        guard withDeviceConfig("wb") { dev in
+            let target = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
+                temperature: Float(value), tint: 0)
+            let gains = dev.deviceWhiteBalanceGains(for: target)
+            let ceiling = dev.maxWhiteBalanceGain
+            func safe(_ v: Float) -> Float { max(1, min(ceiling, v)) }
+            dev.setWhiteBalanceModeLocked(
+                with: AVCaptureDevice.WhiteBalanceGains(redGain: safe(gains.redGain),
+                                                        greenGain: safe(gains.greenGain),
+                                                        blueGain: safe(gains.blueGain)))
+        } else { return }
+        publish {
+            if self.kelvin != value { self.kelvin = value }
+            self.autoWhiteBalance = false
         }
     }
 
     /// 交还给系统的自动白平衡（换了光线环境后一键找回正常色彩）
     func resetWhiteBalance() {
+        // 丢掉还在排队的色温目标，否则它会在这次重置之后又锁回去
+        kelvinQueue.clear()
+        publish {
+            self.autoWhiteBalance = true
+            self.kelvin = 5000
+        }
         sessionQueue.async { [weak self] in
             guard let self, let device = self.videoDevice else { return }
             guard device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) else { return }
-            do {
-                try device.lockForConfiguration()
-                device.whiteBalanceMode = .continuousAutoWhiteBalance
-                device.unlockForConfiguration()
-                DispatchQueue.main.async {
-                    self.autoWhiteBalance = true
-                    self.kelvin = 5000
-                }
-            } catch {
-                Diagnostics.mark("camera.wb-reset-failed")
-            }
+            guard self.withDeviceConfig("wb-reset") { dev in
+                dev.whiteBalanceMode = .continuousAutoWhiteBalance
+            } else { return }
+            Diagnostics.mark("camera.wb-reset-ok")
         }
     }
 
@@ -341,6 +456,16 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
         setExposureBias(0)
         setZoom(1)
         resetWhiteBalance()
+    }
+
+    /// `@Published` 只在主线程写。调节入口都在主线程，但这里再兜一层，
+    /// 以后误从后台线程调用也不会触发「Publishing changes from background threads」。
+    private func publish(_ block: @escaping () -> Void) {
+        if Thread.isMainThread {
+            block()
+        } else {
+            DispatchQueue.main.async(execute: block)
+        }
     }
 
     // MARK: - 取帧（自动识别商品）
@@ -405,9 +530,61 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
             } else {
                 result = .success(outputFileURL)
             }
-            self.onFinish?(result)
+            // 先取一次副本再清空：直接 `onFinish?(x)` 后紧接着置 nil，
+            // 中间若被别的线程写入，那次写入会被这里清掉
+            let handler = self.onFinish
             self.onFinish = nil
+            handler?(result)
         }
+    }
+}
+
+/// 「只保留最新值」的单槽位。
+///
+/// 给滑杆这类高频输入用：拖动时每秒上百个值，真正需要落到设备上的只有最后一个。
+/// - `push`：存入最新值；返回 true 表示此刻没人在处理，调用方需要启动一次 drain。
+/// - `drain`：取走当前值（空则返回 nil）。取过之后 `isIdle` 仍为 false，
+///   直到确认真的没有新值 —— 这样「应用期间新来的值」不会被悄悄丢掉。
+/// - `isIdle`：true 表示既没有待处理值，也没有正在进行的一轮，可以收尾。
+/// - `clear`：丢弃待处理值（重置白平衡时防止旧目标又锁回去）。
+private final class LatestValue<T> {
+    private let lock = NSLock()
+    private var pending: T?
+    private var hasPending = false
+    private var busy = false
+
+    func push(_ value: T) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        pending = value
+        hasPending = true
+        guard !busy else { return false }
+        busy = true
+        return true
+    }
+
+    func drain() -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard hasPending else { return nil }
+        let value = pending
+        pending = nil
+        hasPending = false
+        return value
+    }
+
+    var isIdle: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if !hasPending { busy = false }
+        return !busy
+    }
+
+    func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        pending = nil
+        hasPending = false
     }
 }
 
