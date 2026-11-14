@@ -66,7 +66,7 @@ struct ContentView: View {
     @State private var recognitionDisabledThisRun = false
 
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
-    private let buildTag = "v16"
+    private let buildTag = "v17"
     /// 预览文字的磅值（和下面 copyPreview 里的 13 保持一致）
     private let previewFontPt: CGFloat = 13
 
@@ -122,11 +122,6 @@ struct ContentView: View {
             // 宁可少一个功能，也不能让用户每次拍都闪退。
             let fragile = ["copy.recognize", "process.frame", "process.text",
                            "process.compose", "burn.", "process.save", "camera.record"]
-            // 压字通道单独记一笔：崩在这条路上就自动关掉它，其余功能不受影响
-            if incident.contains("burn.video") {
-                OutputPrefs.burnIntoVideo = false
-                statusText = "已关闭「文案压进动图」（上次崩在这一步）"
-            }
             if fragile.contains(where: { incident.contains($0) }) {
                 let strikes = UserDefaults.standard.integer(forKey: "dtc.crash.strikes") + 1
                 UserDefaults.standard.set(strikes, forKey: "dtc.crash.strikes")
@@ -486,15 +481,13 @@ struct ContentView: View {
             Self.persist(still.url, as: "still.heic", id: shotID)
             ShotStore.shared.mark(shotID, stage: "still")
 
-            // 5) 视频。压字失败只会退化成原始画面，不影响出片。
-            statusText = OutputPrefs.burnIntoVideo ? "处理动图（逐帧压字）…" : "封装视频…"
+            // 5) 视频：相机原片无损重封装 + 配对元数据，不解码、不重编码。
+            //    这是全链路里被 v10~v14 真机验证过最稳的一段，也是唯一能出「动图」的路。
+            statusText = "封装视频…"
             Diagnostics.mark("process.video")
             var video: VideoOutput?
             do {
-                video = try await Self.makeVideo(source: source, overlay: overlay,
-                                                 renderSize: renderSize,
-                                                 identifier: identifier,
-                                                 burnIntoVideo: OutputPrefs.burnIntoVideo)
+                video = try await Self.makeVideo(source: source, identifier: identifier)
             } catch {
                 Diagnostics.mark("process.video-failed")
                 video = nil
@@ -608,14 +601,11 @@ struct ContentView: View {
         }
     }
 
-    private static func makeVideo(source: URL, overlay: CGImage?, renderSize: CGSize,
-                                  identifier: String,
-                                  burnIntoVideo: Bool) async throws -> VideoOutput {
+    private static func makeVideo(source: URL,
+                                  identifier: String) async throws -> VideoOutput {
         try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<VideoOutput, Error>) in
-            BurnEngine.makeVideo(source: source, overlay: overlay, renderSize: renderSize,
-                                 identifier: identifier,
-                                 burnIntoVideo: burnIntoVideo) { result in
+            BurnEngine.makeVideo(source: source, identifier: identifier) { result in
                 continuation.resume(with: result)
             }
         }
