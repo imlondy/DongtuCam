@@ -21,6 +21,7 @@ final class CameraEngine: NSObject, ObservableObject,
     private let snapshotLock = NSLock()
     private var snapshotContinuation: CheckedContinuation<CGImage?, Never>?
     private var wantsSnapshot = false
+    private var videoOutputAttached = false
     private static let ciContext = CIContext()
 
     @Published private(set) var isRecording = false
@@ -56,6 +57,7 @@ final class CameraEngine: NSObject, ObservableObject,
         if session.canAddOutput(videoOutput) {
             session.addOutput(videoOutput)
             videoOutput.setSampleBufferDelegate(self, queue: sessionQueue)
+            videoOutputAttached = true
         }
         // 不强制设置 videoOrientation：由 AVAsset 的 preferredTransform
         // 在导出阶段自动转正，避免 deprecated API 与横竖屏错乱。
@@ -92,6 +94,15 @@ final class CameraEngine: NSObject, ObservableObject,
         sessionQueue.async { [weak self] in
             guard let self, !self.session.isRunning else { return }
             self.session.startRunning()
+            // 保险：极少数机型/格式下多挂一路数据输出会让会话起不来，
+            // 表现为黑屏。此时摘掉抓帧输出再起一次，保证拍摄永远可用。
+            if !self.session.isRunning, self.videoOutputAttached {
+                self.session.beginConfiguration()
+                self.session.removeOutput(self.videoOutput)
+                self.videoOutputAttached = false
+                self.session.commitConfiguration()
+                self.session.startRunning()
+            }
         }
     }
 
