@@ -129,51 +129,19 @@ enum BurnEngine {
 
     // MARK: - 视频
 
-    /// 视频段入口：压字（可选）→ 注入配对元数据。
+    /// 视频段：相机原片**无损重封装** + 注入配对元数据。不解码、不重编码。
     ///
-    /// 两条路都收敛到 `remux`，让**配对元数据只有一份实现**——
-    /// 那部分在 v10 起就稳定，不因换了编码方式再冒一次 3302 的风险。
-    static func makeVideo(source: URL, overlay: CGImage?, renderSize: CGSize,
-                          identifier: String, burnIntoVideo: Bool,
+    /// 这是 v10~v14 在真机上验证过唯一稳定出「动图」的路。逐帧压字通道
+    /// （VideoBurner，v15/v16）在真机上持续闪退，v17 起整体移除：
+    /// 文字只印在静帧上，动图播放时画面里没有字。
+    static func makeVideo(source: URL, identifier: String,
                           completion: @escaping (Result<VideoOutput, Error>) -> Void) {
-        guard burnIntoVideo, let overlay else {
-            remuxPassthrough(source: source, identifier: identifier,
-                             mode: "passthrough", completion: completion)
-            return
-        }
-        Diagnostics.mark("burn.video")
-        VideoBurner.burn(source: source, overlay: overlay, renderSize: renderSize) { result in
-            switch result {
-            case .failure(let error):
-                // 压字失败不能让这一拍白费：退回无损重封装，照片上仍然有字
-                let reason = (error as? LocalizedError)?.errorDescription ?? "fail"
-                remuxPassthrough(source: source, identifier: identifier,
-                                 mode: "burn=skip(\(String(reason.prefix(24))))",
-                                 completion: completion)
-            case .success(let burned):
-                Diagnostics.mark("burn.video-ok")
-                remux(videoURL: burned, identifier: identifier) { remuxResult in
-                    switch remuxResult {
-                    case .failure(let error):
-                        try? FileManager.default.removeItem(at: burned)
-                        completion(.failure(error))
-                    case .success(let url):
-                        try? FileManager.default.removeItem(at: burned)
-                        completion(.success(VideoOutput(url: url, mode: "burn=on")))
-                    }
-                }
-            }
-        }
-    }
-
-    private static func remuxPassthrough(source: URL, identifier: String, mode: String,
-                                         completion: @escaping (Result<VideoOutput, Error>) -> Void) {
         remux(videoURL: source, identifier: identifier) { result in
             switch result {
             case .failure(let error):
                 completion(.failure(error))
             case .success(let url):
-                completion(.success(VideoOutput(url: url, mode: mode)))
+                completion(.success(VideoOutput(url: url, mode: "passthrough")))
             }
         }
     }
