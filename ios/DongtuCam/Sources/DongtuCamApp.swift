@@ -67,7 +67,7 @@ struct ContentView: View {
     @State private var recognitionDisabledThisRun = false
 
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
-    private let buildTag = "v20"
+    private let buildTag = "v21"
     /// 预览文字的磅值（和下面 copyPreview 里的 13 保持一致）
     private let previewFontPt: CGFloat = 13
 
@@ -464,7 +464,9 @@ struct ContentView: View {
             Diagnostics.mark("process.copy")
 
             // 3) 文字层。失败不致命：出无字静帧，仍然能配成实况。
-            let renderSize = CGSize(width: frame.width, height: frame.height)
+            //    画布用 stillCanvasSize（显示尺寸的 1.5 倍）：
+            //    文字按更高像素渲染，缩到屏幕上看才锐利。
+            let renderSize = BurnEngine.stillCanvasSize(for: frame)
             statusText = "排版文字…"
             Diagnostics.mark("process.text")
             var overlay: CGImage? = await Self.overlayInBackground(lines: copyEngine.lines,
