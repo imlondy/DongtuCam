@@ -109,10 +109,8 @@ enum BurnEngine {
             let writer = try AVAssetWriter(outputURL: outURL, fileType: .mov)
             writer.metadata = [contentIdentifierItem(identifier)]
 
-            // passthrough：不重新编码
-            let videoInput = AVAssetWriterInput(mediaType: .video,
-                                                outputSettings: nil,
-                                                sourceFormatHint: track.formatDescriptions.first as? CMFormatDescription)
+            // passthrough：不重新编码（格式由首个 sample buffer 自动推断）
+            let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
             videoInput.expectsMediaDataInRealTime = false
 
             let metadataInput = try makeStillImageTimeInput()
