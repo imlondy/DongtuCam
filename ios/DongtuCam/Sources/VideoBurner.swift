@@ -132,11 +132,15 @@ enum VideoBurner {
             reader.add(videoOut)
 
             var audioOut: AVAssetReaderTrackOutput?
-            if let audioTrack {
+            var audioReader: AVAssetReader?
+            if let audioTrack, let r = try? AVAssetReader(asset: asset) {
+                // 音频单独一个 reader：AVAssetReader 不是线程安全的，
+                // 同一个 reader 的两个 output 不能从两个队列并发读取
                 let o = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
-                if reader.canAdd(o) {
-                    reader.add(o)
+                if r.canAdd(o) {
+                    r.add(o)
                     audioOut = o
+                    audioReader = r
                 }
             }
 
@@ -202,6 +206,7 @@ enum VideoBurner {
                 finish(.failure(BurnEngineError.writerFailed("startReading 失败")))
                 return
             }
+            _ = audioReader?.startReading()
             Diagnostics.mark("burn.video-writing")
 
             // 看门狗：编码器万一拿到帧却一直不 ready，这里兜底退出，别让界面永远转圈
@@ -247,16 +252,20 @@ enum VideoBurner {
                     }
 
                     let pts = CMSampleBufferGetPresentationTimeStamp(sample)
-                    let composed = overlayCI.composited(
-                        over: CIImage(cvPixelBuffer: src).transformed(by: matrix))
+                    // 每帧独立自动释放池：CIImage/CGImage 是 ObjC 对象，
+                    // 150 帧累积不释放会把内存顶到 jetsam 红线（被系统杀掉＝闪退）
+                    let appended: Bool = autoreleasepool {
+                        let composed = overlayCI.composited(
+                            over: CIImage(cvPixelBuffer: src).transformed(by: matrix))
+                        // 不手动 lock：CIContext 渲染到 CVPixelBuffer 时会自己加锁，
+                        // 我们再 lock 一层会和它的 IOSurface 访问打架。
+                        context.render(composed, to: dst,
+                                       bounds: CGRect(origin: .zero, size: outSize),
+                                       colorSpace: colorSpace)
+                        return adaptor.append(dst, withPresentationTime: pts)
+                    }
 
-                    // 不手动 lock：CIContext 渲染到 CVPixelBuffer 时会自己加锁，
-                    // 我们再 lock 一层会和它的 IOSurface 访问打架。
-                    context.render(composed, to: dst,
-                                   bounds: CGRect(origin: .zero, size: outSize),
-                                   colorSpace: colorSpace)
-
-                    if adaptor.append(dst, withPresentationTime: pts) {
+                    if appended {
                         frames += 1
                     } else {
                         burnError = BurnEngineError.writerFailed(
