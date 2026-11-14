@@ -14,36 +14,51 @@ enum LivePhotoWriterError: LocalizedError {
     }
 }
 
+/// 写库结果：用来区分「系统真的存成了实况」和「提交成功但只是一张普通照片」。
+struct LivePhotoOutcome {
+    /// true = 回读确认是实况；false = 存成了普通照片；nil = 没权限回读，无法确认
+    let verifiedLive: Bool?
+}
+
 /// 把「带文字的 HEIC 静帧 + 配好元数据的 MOV」交给 PhotoKit 配成一张实况照片。
 ///
-/// ## v19：只剩一种提交方式，因为它必须不再崩
+/// ## v20：两个资源都走 fileURL（这是唯一正确的投递方式）
 ///
-/// 历史上的三种尝试（A 图 data + 视频 data / B 图 data + 视频 fileURL /
-/// C 再加 shouldMoveFile）里，真机崩溃现场多次停在 `save.commit-B`，
-/// 随后是 `!! 信号崩溃 signal=5`（SIGTRAP = 框架内部断言，catch 不到）。
-/// 结论很直接：**用 fileURL 提交配对视频这条路在这台机器上会直接打死进程**，
-/// 无论原因是什么（沙盒扩展 / 资源校验），都不能再留作「重试」——
-/// 重试一个会崩进程的分支，等于每次失败都必然崩一次。
+/// v19 的真机日志是唯一一次拿到完整现场，信息量很大：
+/// ```
+/// save.preflight-ok              ← 系统能把这对文件解成 PHLivePhoto，配对元数据是对的
+/// save.commit-data               ← 用 Data 提交这一对
+/// save.commit-failed             ← 两次都失败
+/// save.still-ok / save.video-ok  ← 同样这两个文件，单独用 fileURL 提交都成功
+/// ```
 ///
-/// 所以现在：
-///   1. 只尝试 A（两个资源都用 Data 提交，不涉及文件 URL，v10 真机验证通过）；
-///   2. 失败就如实返回错误（含 PhotoKit 错误码），由调用方降级成「照片 + 视频分别存」；
-///   3. 就算真的崩了，静帧和视频都已在暂存区，下次启动会自动补存。
+/// 也就是说：**不是元数据的错，是「Data 投递」被 PhotoKit 拒绝。**
+/// Photos 对实况配对的投递方式有隐藏约束——它不接受「一半 Data、一半文件」的混投，
+/// 而 v18 那次 `signal=5`（SIGTRAP，框架内部断言）正是死在
+/// 「图 data + 视频 url」的混合投递上。v19 改成两边都用 Data，虽然不崩了，
+/// 但系统同样不收（这就是 commit-failed 两次都出现的原因）。
 ///
-/// 另外 v19 修掉了更根本的一致性缺陷（见 `StillGeometry`）：静帧与视频的
-/// 编码尺寸 / 方向此前不一致，PhotoKit 会判这对资源无效，这才是 A 一直失败的原因。
+/// 所以 v20 只留一条路，也是所有「视频转实况」类 App 的标准写法：
+/// **静帧和配对视频都走 fileURL，投递方式保持一致。**
+/// 顺带解决了内存问题：不再把整个视频读成 Data（几十 MB 常驻内存正是被系统
+/// SIGKILL 的温床），系统按文件读，进程里只留一张静帧的字节。
+///
+/// 失败时把 PhotoKit 的错误码写进面包屑（如 `save.fail-3303`），下一轮不用再靠猜。
 enum LivePhotoWriter {
+
+    // MARK: - 主路径：实况配对
+
     static func save(still: URL, video: URL, report: String = "",
-                     completion: @escaping (Result<Void, Error>) -> Void) {
-        Diagnostics.mark("save.begin")
-        guard let stillData = try? Data(contentsOf: still) else {
-            Diagnostics.mark("save.still-unreadable")
-            completion(.failure(LivePhotoWriterError.failed("无法读取静帧文件")))
+                     completion: @escaping (Result<LivePhotoOutcome, Error>) -> Void) {
+        Diagnostics.markMem("save.begin")
+        guard FileManager.default.fileExists(atPath: still.path) else {
+            Diagnostics.mark("save.still-missing")
+            completion(.failure(LivePhotoWriterError.failed("静帧文件不存在")))
             return
         }
-        guard let videoData = try? Data(contentsOf: video) else {
-            Diagnostics.mark("save.video-unreadable")
-            completion(.failure(LivePhotoWriterError.failed("无法读取视频文件")))
+        guard FileManager.default.fileExists(atPath: video.path) else {
+            Diagnostics.mark("save.video-missing")
+            completion(.failure(LivePhotoWriterError.failed("配对视频不存在")))
             return
         }
 
@@ -53,14 +68,87 @@ enum LivePhotoWriter {
                 completion(.failure(LivePhotoWriterError.denied))
                 return
             }
-            // 写库前先让系统认一遍这对文件（纯读，不写库）：能认成 PHLivePhoto
-            // 说明配对元数据正确，剩下的只是 PhotoKit 收不收这对资源
+            // 写库前先让系统读一遍（纯读，不写库）：能解成 PHLivePhoto
+            // 说明配对元数据没问题，剩下的只是投递方式
             preflight(still: still, video: video) { note in
-                let context = [report, note].filter { !$0.isEmpty }.joined(separator: " ")
-                commit(stillData: stillData, videoData: videoData, context: context,
+                commit(still: still, video: video, note: note, report: report,
                        completion: completion)
             }
         }
+    }
+
+    private static func commit(still: URL, video: URL, note: String, report: String,
+                               completion: @escaping (Result<LivePhotoOutcome, Error>) -> Void) {
+        Diagnostics.mark("save.commit")
+        var created: String?
+        PHPhotoLibrary.shared().performChanges {
+            let creation = PHAssetCreationRequest.forAsset()
+
+            // 两个资源必须同一种投递方式（都用 URL）。混投会被 PhotoKit 直接拒绝。
+            let photoOptions = PHAssetResourceCreationOptions()
+            photoOptions.originalFilename = "IMG_DTC.HEIC"
+            photoOptions.shouldMoveFile = false
+
+            let videoOptions = PHAssetResourceCreationOptions()
+            videoOptions.originalFilename = "IMG_DTC.MOV"
+            // 不搬走：暂存目录里的这一对文件是「崩溃也能补存」的安全网，
+            // 提交一旦失败还要靠它们降级重来。视频只有几 MB，拷一份不值得冒险。
+            videoOptions.shouldMoveFile = false
+
+            creation.addResource(with: .photo, fileURL: still, options: photoOptions)
+            creation.addResource(with: .pairedVideo, fileURL: video, options: videoOptions)
+
+            created = creation.placeholderForCreatedAsset?.localIdentifier
+        } completionHandler: { success, error in
+            if success {
+                let isLive = verify(placeholder: created)
+                if isLive == false {
+                    // 系统收下了，但回读发现只是一张普通照片：不能对用户谎报成功
+                    Diagnostics.mark("save.plain")
+                    var message = "系统把它存成了普通照片（实况没配上）"
+                    if !note.isEmpty { message += " · \(note)" }
+                    DispatchQueue.main.async {
+                        completion(.failure(LivePhotoWriterError.failed(message)))
+                    }
+                    return
+                }
+                Diagnostics.markMem(isLive == true ? "save.live-ok" : "save.ok-unverified")
+                DispatchQueue.main.async {
+                    completion(.success(LivePhotoOutcome(verifiedLive: isLive)))
+                }
+                return
+            }
+            let nsError = error as NSError?
+            let code = nsError?.code ?? -1
+            // 错误码先进面包屑：文件里出现 save.fail-3303 这种，就是直接判据
+            Diagnostics.mark("save.fail-\(code)")
+            var message = "实况提交被系统拒绝（\(nsError?.domain ?? "?") \(code)）"
+            if !note.isEmpty { message += " · \(note)" }
+            if !report.isEmpty { message += " · \(String(report.suffix(120)))" }
+            DispatchQueue.main.async {
+                completion(.failure(LivePhotoWriterError.failed(message)))
+            }
+        }
+    }
+
+    /// 写完立刻回读，确认落进相册的确实是「实况」而不是一张普通照片。
+    /// 只有拿到完整相册权限才读得到；拿不到就返回 nil（不影响主流程）。
+    private static func verify(placeholder: String?) -> Bool? {
+        guard let placeholder else {
+            Diagnostics.mark("save.verify-no-id")
+            return nil
+        }
+        let level = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard level == .authorized || level == .limited else {
+            Diagnostics.mark("save.verify-skip")
+            return nil
+        }
+        let assets = PHAsset.fetchAssets(withLocalIdentifiers: [placeholder], options: nil)
+        guard let asset = assets.firstObject else {
+            Diagnostics.mark("save.verify-none")
+            return nil
+        }
+        return asset.mediaSubtypes.contains(.photoLive)
     }
 
     // MARK: - 降级：只存照片
@@ -79,6 +167,7 @@ enum LivePhotoWriter {
                 let creation = PHAssetCreationRequest.forAsset()
                 let options = PHAssetResourceCreationOptions()
                 options.originalFilename = "DTC_TEXT.HEIC"
+                options.shouldMoveFile = false
                 creation.addResource(with: .photo, fileURL: still, options: options)
             } completionHandler: { success, error in
                 Diagnostics.mark(success ? "save.still-ok" : "save.still-failed")
@@ -99,12 +188,11 @@ enum LivePhotoWriter {
     /// 最后一道兜底：把视频原样存成普通视频。
     ///
     /// 这条不是「可选项」而是**安全网**：处理链路任何一步失败甚至进程被带走，
-    /// 只要原片还在，至少能让用户拿到一段视频（用户对 v13 的印象就是
-    /// 「闪退但相册里有视频」，说明这个兜底是有价值的）。
+    /// 只要原片还在，至少能让用户拿到一段视频。
     static func saveVideo(_ video: URL, completion: @escaping (Result<Void, Error>) -> Void) {
         Diagnostics.mark("save.video-begin")
         guard FileManager.default.fileExists(atPath: video.path) else {
-            Diagnostics.mark("save.video-missing")
+            Diagnostics.mark("save.video-gone")
             completion(.failure(LivePhotoWriterError.failed("视频文件不存在")))
             return
         }
@@ -159,12 +247,15 @@ enum LivePhotoWriter {
     private static func preflight(still: URL, video: URL,
                                   done: @escaping (String) -> Void) {
         Diagnostics.mark("save.preflight")
+        // 只允许回调一次：系统回调与下面 8 秒超时兜底二选一
+        let once = OnceFlag()
         PHLivePhoto.request(withResourceFileURLs: [still, video],
                             placeholderImage: nil,
                             // 别用 .zero：那会按全尺寸解码整套实况，内存峰值陡增；
                             // 配对校验只需要小图
                             targetSize: CGSize(width: 320, height: 428),
                             contentMode: .aspectFit) { photo, info in
+            guard once.claim() else { return }
             var note = photo != nil ? "pair=ok" : "pair=nil"
             if photo == nil, let error = info[PHLivePhotoInfoErrorKey] as? NSError {
                 note += "(\(error.code))"
@@ -172,47 +263,25 @@ enum LivePhotoWriter {
             Diagnostics.mark("save.preflight-\(photo != nil ? "ok" : "nil")")
             DispatchQueue.main.async { done(note) }
         }
-    }
-
-    // MARK: - 提交（只用 data，绝不碰 fileURL）
-
-    private static func commit(stillData: Data, videoData: Data, context: String,
-                               completion: @escaping (Result<Void, Error>) -> Void) {
-        let sizeMB = Double(videoData.count) / 1024.0 / 1024.0
-        Diagnostics.mark("save.commit-data")
-        PHPhotoLibrary.shared().performChanges {
-            let creation = PHAssetCreationRequest.forAsset()
-
-            // 静帧：给上文件名（.HEIC 后缀让 PhotoKit 不必去猜类型）
-            let photoOptions = PHAssetResourceCreationOptions()
-            photoOptions.originalFilename = "IMG_DTC.HEIC"
-            creation.addResource(with: .photo, data: stillData, options: photoOptions)
-
-            let videoOptions = PHAssetResourceCreationOptions()
-            videoOptions.originalFilename = "IMG_DTC.MOV"
-            creation.addResource(with: .pairedVideo, data: videoData, options: videoOptions)
-        } completionHandler: { success, error in
-            DispatchQueue.main.async {
-                if success {
-                    Diagnostics.mark("save.commit-ok")
-                    completion(.success(()))
-                    return
-                }
-                Diagnostics.mark("save.commit-failed")
-                var message = "实况提交被系统拒绝"
-                if let nsError = error as NSError? {
-                    message += "（\(nsError.domain) \(nsError.code)）"
-                    let keys = nsError.userInfo.keys
-                        .map { "\($0)" }
-                        .filter { $0.contains("PH") || $0.contains("Resource") }
-                        .sorted()
-                        .joined(separator: ",")
-                    if !keys.isEmpty { message += " [\(keys)]" }
-                }
-                message += String(format: " · 视频%.1fMB", sizeMB)
-                if !context.isEmpty { message += " · \(String(context.suffix(150)))" }
-                completion(.failure(LivePhotoWriterError.failed(message)))
-            }
+        // 万一系统不回调（极端情况），别让界面永远停在「写入相册…」
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+            guard once.claim() else { return }
+            Diagnostics.mark("save.preflight-timeout")
+            done("pair=unknown")
         }
+    }
+}
+
+/// 只允许成功一次的开关（跨线程安全）。用来保证异步回调只有一条路径生效。
+final class OnceFlag {
+    private let lock = NSLock()
+    private var used = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if used { return false }
+        used = true
+        return true
     }
 }
