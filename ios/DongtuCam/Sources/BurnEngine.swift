@@ -23,18 +23,18 @@ enum BurnEngineError: LocalizedError {
     }
 }
 
-/// 把同一张文字图同时烧进「静帧」和「视频每一帧」，产出可配对成 Live Photo 的一对文件。
+/// 产出可配对成 Live Photo 的一对文件（带文字的静帧 + 带文字的 H.264 视频）。
 ///
-/// Live Photo 的两个资源靠同一个 assetIdentifier 绑定：
-///   1. 静帧（HEIC）的 MakerApple 字典里写 `{"17": identifier}`；
-///   2. 视频（MOV，H.264）里写两条元数据：
-///      - `com.apple.quicktime.content.identifier` = identifier —— 文件级 metadata
-///        （写 AVAssetWriter.metadata，不是 timed metadata）；
-///      - `com.apple.quicktime.still-image-time` —— 轨道级 timed metadata，
-///        必须用带 sourceFormatHint（SInt8）的 AVAssetWriterInput 写入，值 -1（0xFF）。
+/// 拆成两步，避开 AVAssetReaderVideoCompositionOutput 手动抽帧的崩溃（iOS 27 上
+/// applyingCIFiltersWithHandler 的 composition 再手动强设 renderSize/frameDuration
+/// 会触发 `_figAssetReaderSampleBufferDidBecomeAvailableForExtractionID` 内部异常）：
+///   第一步：AVAssetExportSession 烧字导出 H.264 MOV（简单、已验证稳定）；
+///   第二步：AVAssetReaderTrackOutput + AVAssetWriterInput 走 passthrough 无损重封装，
+///           只注入 Live Photo 配对元数据，不重新编码、不碰 CIFilter。
 ///
-/// 之前的坑：把两条都塞进 timed metadata、且 metadata input 没给 sourceFormatHint，
-/// 导致写入格式不合法、录制结束瞬间闪退。
+/// 元数据两条（对应已验证写法）：
+///   content.identifier —— 文件级，写 AVAssetWriter.metadata；
+///   still-image-time —— 轨道级 timed metadata，带 sourceFormatHint(SInt8)，值 -1。
 enum BurnEngine {
     static func render(source: URL, overlay: CGImage, seconds: Double = 5.0,
                        completion: @escaping (Result<BurnOutput, Error>) -> Void) {
@@ -46,52 +46,75 @@ enum BurnEngine {
 
         let identifier = UUID().uuidString
         let textCI = CIImage(cgImage: overlay)
-
-        let natural = videoTrack.naturalSize.applying(videoTrack.preferredTransform)
-        let width = even(Int(abs(natural.width)))
-        let height = even(Int(abs(natural.height)))
-        let renderSize = CGSize(width: width, height: height)
-
         let duration = CMTimeMinimum(asset.duration,
                                      CMTime(seconds: seconds, preferredTimescale: 600))
-        let outVideo = tmpURL("burn.mov")
+
+        // —— 第一步：AVAssetExportSession 烧字（不手动设 renderSize/frameDuration）——
+        let composition = AVMutableVideoComposition(
+            asset: asset,
+            applyingCIFiltersWithHandler: { request in
+                let src = request.sourceImage
+                let sx = src.extent.width / max(1, textCI.extent.width)
+                let sy = src.extent.height / max(1, textCI.extent.height)
+                let fitted = textCI.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
+                request.finish(with: fitted.composited(over: src), context: nil)
+            })
+
+        let intermediate = tmpURL("intermediate.mov")
+        guard let exporter = AVAssetExportSession(asset: asset,
+                                                  presetName: AVAssetExportPresetHighestQuality) else {
+            completion(.failure(BurnEngineError.writerFailed("无法创建导出会话")))
+            return
+        }
+        exporter.outputURL = intermediate
+        exporter.outputFileType = .mov
+        exporter.videoComposition = composition
+        exporter.timeRange = CMTimeRange(start: .zero, duration: duration)
+
+        exporter.exportAsynchronously {
+            guard exporter.status == .completed else {
+                let reason = exporter.error?.localizedDescription
+                    ?? "status=\(exporter.status.rawValue)"
+                completion(.failure(BurnEngineError.writerFailed(reason)))
+                return
+            }
+            // —— 第二步：passthrough 重封装 + 注入配对元数据 ——
+            injectMetadata(videoURL: intermediate, identifier: identifier) { injected in
+                switch injected {
+                case .failure(let e):
+                    completion(.failure(e))
+                case .success(let finalVideo):
+                    completion(makeStill(asset: asset, textCI: textCI,
+                                         videoURL: finalVideo, identifier: identifier))
+                }
+            }
+        }
+    }
+
+    /// 无损重封装：读原视频 sample → 原样写回，只加两条 Live Photo 配对元数据
+    private static func injectMetadata(videoURL: URL, identifier: String,
+                                       completion: @escaping (Result<URL, Error>) -> Void) {
+        let asset = AVAsset(url: videoURL)
+        guard let track = asset.tracks(withMediaType: .video).first else {
+            completion(.failure(BurnEngineError.writerFailed("中间视频没有视频轨")))
+            return
+        }
+        let outURL = tmpURL("burn.mov")
 
         do {
-            // —— 读取端：逐帧转正 + 烧字 ——
             let reader = try AVAssetReader(asset: asset)
-            let readerOutput = AVAssetReaderVideoCompositionOutput(
-                videoTracks: [videoTrack],
-                videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
-            let composition = AVMutableVideoComposition(
-                asset: asset,
-                applyingCIFiltersWithHandler: { request in
-                    let src = request.sourceImage
-                    let sx = src.extent.width / max(1, textCI.extent.width)
-                    let sy = src.extent.height / max(1, textCI.extent.height)
-                    let fitted = textCI.transformed(by: CGAffineTransform(scaleX: sx, y: sy))
-                    request.finish(with: fitted.composited(over: src), context: nil)
-                })
-            composition.renderSize = renderSize
-            composition.frameDuration = CMTime(value: 1, timescale: 30)
-            readerOutput.videoComposition = composition
-            readerOutput.alwaysCopiesSampleData = false
+            let readerOutput = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
             reader.add(readerOutput)
 
-            // —— 写入端 ——
-            let writer = try AVAssetWriter(outputURL: outVideo, fileType: .mov)
-
-            // ① 视频：H.264（Live Photo 兼容、编码快、内存低）
-            let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: width,
-                AVVideoHeightKey: height
-            ])
-            videoInput.expectsMediaDataInRealTime = false
-
-            // ② content.identifier 写文件级 metadata
+            let writer = try AVAssetWriter(outputURL: outURL, fileType: .mov)
             writer.metadata = [contentIdentifierItem(identifier)]
 
-            // ③ still-image-time 写轨道级 timed metadata（带 sourceFormatHint）
+            // passthrough：不重新编码
+            let videoInput = AVAssetWriterInput(mediaType: .video,
+                                                outputSettings: nil,
+                                                sourceFormatHint: track.formatDescriptions.first)
+            videoInput.expectsMediaDataInRealTime = false
+
             let metadataInput = try makeStillImageTimeInput()
             metadataInput.expectsMediaDataInRealTime = false
             let metadataAdaptor = AVAssetWriterInputMetadataAdaptor(assetWriterInput: metadataInput)
@@ -111,7 +134,7 @@ enum BurnEngine {
             writer.startSession(atSourceTime: .zero)
             reader.startReading()
 
-            // 录制开始后、视频第一帧之前，写入 still-image-time
+            // 轨道级 still-image-time
             let stillItem = AVMutableMetadataItem()
             stillItem.key = "com.apple.quicktime.still-image-time" as NSString
             stillItem.keySpace = .quickTimeMetadata
@@ -119,9 +142,9 @@ enum BurnEngine {
             stillItem.dataType = kCMMetadataBaseDataType_SInt8 as String
             metadataAdaptor.append(AVTimedMetadataGroup(
                 items: [stillItem],
-                timeRange: CMTimeRange(start: .zero, duration: duration)))
+                timeRange: CMTimeRange(start: .zero, duration: asset.duration)))
 
-            let queue = DispatchQueue(label: "dtc.burn.write")
+            let queue = DispatchQueue(label: "dtc.meta.write")
             var done = false
             videoInput.requestMediaDataWhenReady(on: queue) {
                 while videoInput.isReadyForMoreMediaData && !done {
@@ -137,8 +160,7 @@ enum BurnEngine {
                 writer.finishWriting {
                     DispatchQueue.main.async {
                         if writer.status == .completed {
-                            completion(makeStill(asset: asset, textCI: textCI,
-                                                 videoURL: outVideo, identifier: identifier))
+                            completion(.success(outURL))
                         } else {
                             let reason = writer.error?.localizedDescription
                                 ?? "status=\(writer.status.rawValue)"
@@ -225,11 +247,6 @@ enum BurnEngine {
         CGImageDestinationAddImage(dest, image, props as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
         return data as Data
-    }
-
-    private static func even(_ v: Int) -> Int {
-        let e = v - (v % 2)
-        return max(2, e)
     }
 
     private static func tmpURL(_ name: String) -> URL {
