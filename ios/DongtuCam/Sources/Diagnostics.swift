@@ -21,6 +21,11 @@ enum Diagnostics {
     private static let lock = NSLock()
     /// 上一次运行留下的现场，启动时取走并清空
     private static var pendingIncident: String?
+    /// 那份现场是哪个构建留下的（从 `app.launch` 行里抠出来）。
+    ///
+    /// 不记这个的话，刚装新版打开就会看到「v24 上次现场」—— 里面其实是上一版
+    /// 的崩溃，会让人误以为新版又崩了，白白多排查一轮。
+    private static var pendingTag: String?
 
     private static let formatter: DateFormatter = {
         let f = DateFormatter()
@@ -30,24 +35,37 @@ enum Diagnostics {
 
     // MARK: - 启动
 
-    static func installCrashHandler() {
+    static func installCrashHandler(tag: String = "") {
         ensureOpen()
         // 先把上一轮的历史读出来，再清空，避免本轮的步骤混进「上次现场」
         pendingIncident = readTail()
+        pendingTag = pendingIncident.flatMap { incident -> String? in
+            // 取最后一条 app.launch 里的版本标记
+            let line = incident.split(separator: "\n").last(where: { $0.contains("app.launch tag=") })
+            guard let line, let range = line.range(of: "app.launch tag=") else { return nil }
+            let tag = String(line[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+            return tag.isEmpty ? nil : tag
+        }
+        // 本版每次启动都会写 `tag=`，所以「没有版本标记」的现场一定是更早的构建留下的。
+        // 那种账已经算过了，不能再糊到新版本头上 —— 直接丢弃。
+        if pendingTag == nil { pendingIncident = nil }
         if fd >= 0 { _ = ftruncate(fd, 0) }
 
         NSSetUncaughtExceptionHandler(dtcHandleException)
         for sig in [SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP] {
             signal(sig, dtcSignalHandler)
         }
-        mark("app.launch")
+        mark(tag.isEmpty ? "app.launch" : "app.launch tag=\(tag)")
     }
 
     /// 启动时取上次遗留的现场；取完即清，避免重复提示
-    static func takeLastIncident() -> String? {
-        defer { pendingIncident = nil }
+    static func takeLastIncident() -> (tag: String?, text: String)? {
+        defer {
+            pendingIncident = nil
+            pendingTag = nil
+        }
         guard let text = pendingIncident, !text.isEmpty else { return nil }
-        return text
+        return (pendingTag, text)
     }
 
     // MARK: - 面包屑
