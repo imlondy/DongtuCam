@@ -84,12 +84,22 @@ enum Diagnostics {
         if fd < 0 { fd = open(stepPath, O_WRONLY | O_CREAT | O_APPEND, 0o644) }
     }
 
-    /// 读最后 14 行
+    /// 读最后 40 行。
+    ///
+    /// 曾经只读 14 行，结果关键一轮的现场被「启动+恢复」的 9 条面包屑顶出了窗口，
+    /// 崩溃点两侧全空白，白白多排查一轮。改 40 行后，一次完整的
+    /// 「启动 → 恢复 → 拍摄 → 处理」都在窗口内。
     private static func readTail() -> String? {
         guard let text = try? String(contentsOfFile: stepPath, encoding: .utf8) else { return nil }
         let lines = text.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
         guard !lines.isEmpty else { return nil }
-        return lines.suffix(14).joined(separator: "\n")
+        var tail = Array(lines.suffix(40))
+        // 文件里没有 "!!" 说明进程不是被信号/异常带走的，而是被系统直接杀掉
+        // （jetsam 内存回收 / 看门狗）。这两种死法装不上处理器，只能靠推断。
+        if !tail.contains(where: { $0.contains("!!") }) {
+            tail.append("（无异常记录：进程被系统强制结束，多为内存不足）")
+        }
+        return tail.joined(separator: "\n")
     }
 
     /// 供崩溃处理器写入（不取锁：崩溃时可能正持有锁）
