@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreMedia
 import CoreImage
 import UIKit
 import ImageIO
@@ -24,15 +25,16 @@ enum BurnEngineError: LocalizedError {
 
 /// 把同一张文字图同时烧进「静帧」和「视频每一帧」，产出可配对成 Live Photo 的一对文件。
 ///
-/// 关键（三次踩坑后的最终结论）：
-///   Live Photo 保存进相册时，PhotoKit 只接受「HEIC 静帧 + HEVC 编码的 MOV」这对组合。
-///   任一条件不满足（静帧是 JPEG、或视频是 H.264）都会直接报
-///   `PHPhotosErrorDomain 3302 (InvalidResource)`。
+/// Live Photo 的两个资源靠同一个 assetIdentifier 绑定：
+///   1. 静帧（HEIC）的 MakerApple 字典里写 `{"17": identifier}`；
+///   2. 视频（MOV，H.264）里写两条元数据：
+///      - `com.apple.quicktime.content.identifier` = identifier —— 文件级 metadata
+///        （写 AVAssetWriter.metadata，不是 timed metadata）；
+///      - `com.apple.quicktime.still-image-time` —— 轨道级 timed metadata，
+///        必须用带 sourceFormatHint（SInt8）的 AVAssetWriterInput 写入，值 -1（0xFF）。
 ///
-///   而且配对标识不能靠 AVAssetExportSession.metadata 写——它只能写文件级 metadata，
-///   写不进视频轨道里的 timed metadata。必须用 AVAssetWriter + AVAssetWriterInputMetadataAdaptor
-///   把 com.apple.quicktime.content.identifier 与 com.apple.quicktime.still-image-time
-///   写到视频轨道的开头。still-image-time 的值应为 -1（表示封面是独立 HEIC，不是从视频抽帧）。
+/// 之前的坑：把两条都塞进 timed metadata、且 metadata input 没给 sourceFormatHint，
+/// 导致写入格式不合法、录制结束瞬间闪退。
 enum BurnEngine {
     static func render(source: URL, overlay: CGImage, seconds: Double = 5.0,
                        completion: @escaping (Result<BurnOutput, Error>) -> Void) {
@@ -42,11 +44,9 @@ enum BurnEngine {
             return
         }
 
-        // HEIC 静帧与 MOV 视频共用的配对标识
         let identifier = UUID().uuidString
         let textCI = CIImage(cgImage: overlay)
 
-        // 转正后的输出尺寸（CIFilter handler 会自动应用 preferredTransform）
         let natural = videoTrack.naturalSize.applying(videoTrack.preferredTransform)
         let width = even(Int(abs(natural.width)))
         let height = even(Int(abs(natural.height)))
@@ -77,17 +77,22 @@ enum BurnEngine {
             readerOutput.alwaysCopiesSampleData = false
             reader.add(readerOutput)
 
-            // —— 写入端：强制 HEVC + 视频轨道级配对元数据 ——
+            // —— 写入端 ——
             let writer = try AVAssetWriter(outputURL: outVideo, fileType: .mov)
 
+            // ① 视频：H.264（Live Photo 兼容、编码快、内存低）
             let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: [
-                AVVideoCodecKey: AVVideoCodecType.hevc,
+                AVVideoCodecKey: AVVideoCodecType.h264,
                 AVVideoWidthKey: width,
                 AVVideoHeightKey: height
             ])
             videoInput.expectsMediaDataInRealTime = false
 
-            let metadataInput = AVAssetWriterInput(mediaType: .metadata, outputSettings: nil)
+            // ② content.identifier 写文件级 metadata
+            writer.metadata = [contentIdentifierItem(identifier)]
+
+            // ③ still-image-time 写轨道级 timed metadata（带 sourceFormatHint）
+            let metadataInput = try makeStillImageTimeInput()
             metadataInput.expectsMediaDataInRealTime = false
             let metadataAdaptor = AVAssetWriterInputMetadataAdaptor(assetWriterInput: metadataInput)
 
@@ -98,16 +103,23 @@ enum BurnEngine {
             writer.add(videoInput)
             writer.add(metadataInput)
 
-            writer.startWriting()
+            guard writer.startWriting() else {
+                let reason = writer.error?.localizedDescription ?? "startWriting 失败"
+                completion(.failure(BurnEngineError.writerFailed(reason)))
+                return
+            }
             writer.startSession(atSourceTime: .zero)
             reader.startReading()
 
-            // 视频第一帧之前写入配对元数据（必须在此处，而不是导出后再补）
-            let group = AVTimedMetadataGroup(
-                items: livePhotoMetadata(identifier: identifier),
-                timeRange: CMTimeRange(start: .zero,
-                                       duration: CMTime(value: 1, timescale: 600)))
-            metadataAdaptor.append(group)
+            // 录制开始后、视频第一帧之前，写入 still-image-time
+            let stillItem = AVMutableMetadataItem()
+            stillItem.key = "com.apple.quicktime.still-image-time" as NSString
+            stillItem.keySpace = .quickTimeMetadata
+            stillItem.value = -1 as NSNumber
+            stillItem.dataType = kCMMetadataBaseDataType_SInt8 as String
+            metadataAdaptor.append(AVTimedMetadataGroup(
+                items: [stillItem],
+                timeRange: CMTimeRange(start: .zero, duration: duration)))
 
             let queue = DispatchQueue(label: "dtc.burn.write")
             var done = false
@@ -140,23 +152,39 @@ enum BurnEngine {
         }
     }
 
-    /// 视频侧配对元数据：content identifier + still-image-time(-1)
-    private static func livePhotoMetadata(identifier: String) -> [AVMetadataItem] {
-        let contentID = AVMutableMetadataItem()
-        contentID.keySpace = .quickTimeMetadata
-        contentID.key = "com.apple.quicktime.content.identifier" as NSString
-        contentID.value = identifier as NSString
-
-        let stillTime = AVMutableMetadataItem()
-        stillTime.keySpace = .quickTimeMetadata
-        stillTime.key = "com.apple.quicktime.still-image-time" as NSString
-        stillTime.value = -1 as NSNumber
-
-        return [contentID, stillTime]
+    /// 文件级 content.identifier
+    private static func contentIdentifierItem(_ identifier: String) -> AVMetadataItem {
+        let item = AVMutableMetadataItem()
+        item.key = "com.apple.quicktime.content.identifier" as NSString
+        item.keySpace = .quickTimeMetadata
+        item.value = identifier as NSString
+        item.dataType = kCMMetadataBaseDataType_UTF8 as String
+        return item
     }
 
-    /// 静帧必须带文字（否则长按实况时文字会「闪现一下再消失」），
-    /// 且必须存成 HEIC 并把配对标识写进 MakerApple 的 "17" 字段。
+    /// 轨道级 still-image-time 的写入输入：必须带 SInt8 的 sourceFormatHint
+    private static func makeStillImageTimeInput() throws -> AVAssetWriterInput {
+        let spec: [CFString: Any] = [
+            kCMMetadataFormatDescriptionMetadataSpecificationKey_Identifier:
+                "mdta/com.apple.quicktime.still-image-time",
+            kCMMetadataFormatDescriptionMetadataSpecificationKey_DataType:
+                kCMMetadataBaseDataType_SInt8
+        ]
+        var desc: CMFormatDescription?
+        let status = CMMetadataFormatDescriptionCreateWithMetadataSpecifications(
+            allocator: kCFAllocatorDefault,
+            metadataType: kCMMetadataFormatType_Boxed,
+            metadataSpecifications: [spec] as CFArray,
+            formatDescriptionOut: &desc)
+        guard status == noErr, let desc else {
+            throw BurnEngineError.writerFailed("无法创建 still-image-time 元数据格式")
+        }
+        return AVAssetWriterInput(mediaType: .metadata,
+                                  outputSettings: nil,
+                                  sourceFormatHint: desc)
+    }
+
+    /// 静帧：带文字 + HEIC + MakerApple "17" 配对标识
     private static func makeStill(asset: AVAsset, textCI: CIImage,
                                   videoURL: URL, identifier: String) -> Result<BurnOutput, Error> {
         let generator = AVAssetImageGenerator(asset: asset)
