@@ -47,7 +47,7 @@ enum BurnEngine {
         let duration = CMTimeMinimum(asset.duration,
                                      CMTime(seconds: seconds, preferredTimescale: 600))
 
-        // —— ① 烧字导出（AVAssetExportSession 最稳，不手动设 renderSize/frameDuration）——
+        // —— ① 烧字导出（不手动设 renderSize/frameDuration，避免抽帧崩溃）——
         let composition = AVMutableVideoComposition(
             asset: asset,
             applyingCIFiltersWithHandler: { request in
@@ -58,59 +58,88 @@ enum BurnEngine {
                 request.finish(with: fitted.composited(over: src), context: nil)
             })
 
-        let intermediate = tmpURL("intermediate.mov")
-        guard let exporter = AVAssetExportSession(asset: asset,
-                                                  presetName: AVAssetExportPresetHighestQuality) else {
-            completion(.failure(BurnEngineError.writerFailed("无法创建导出会话")))
-            return
-        }
-        exporter.outputURL = intermediate
-        exporter.outputFileType = .mov
-        exporter.videoComposition = composition
-        exporter.timeRange = CMTimeRange(start: .zero, duration: duration)
-
-        exporter.exportAsynchronously {
-            guard exporter.status == .completed else {
-                let reason = exporter.error?.localizedDescription
-                    ?? "status=\(exporter.status.rawValue)"
-                completion(.failure(BurnEngineError.writerFailed(reason)))
-                return
-            }
-            // —— ② 无损重封装，注入两条配对元数据 ——
-            remux(videoURL: intermediate, identifier: identifier) { result in
-                switch result {
-                case .failure(let error):
-                    completion(.failure(error))
-                case .success(let finalVideo):
-                    // —— ③ 生成带标识的 HEIC 静帧 ——
-                    // 关键：静帧从「已烧字的成片」抽，尺寸/朝向与视频天然一致，
-                    // 避免「图片竖屏 1080x1440、视频横屏 1920x1080」这种配对不一致。
-                    guard let frame = stillFrame(videoURL: finalVideo) else {
-                        completion(.failure(BurnEngineError.stillFailed("无法解码视频帧")))
-                        return
+        // HEVC 优先（与 HEIC 静帧同编码族，新系统校验更容易过），失败自动退回 H.264
+        let presets = [AVAssetExportPresetHEVCHighestQuality,
+                       AVAssetExportPresetHighestQuality]
+        export(source: asset, composition: composition, duration: duration,
+               presets: presets) { exported in
+            switch exported {
+            case .failure(let error):
+                completion(.failure(error))
+            case .success(let burned):
+                // —— ② 无损重封装，注入两条配对元数据 ——
+                remux(videoURL: burned, identifier: identifier) { remuxed in
+                    switch remuxed {
+                    case .failure(let error):
+                        completion(.failure(error))
+                    case .success(let finalVideo):
+                        finish(videoURL: finalVideo, identifier: identifier,
+                               completion: completion)
                     }
-                    var notes: [String] = []
-                    let made = makeStill(frame, identifier: identifier, notes: &notes)
-                    guard let made else {
-                        completion(.failure(BurnEngineError.stillFailed(
-                            notes.joined(separator: " / "))))
-                        return
-                    }
-                    let stillData = made.0
-                    let stillName = made.1
-                    let stillURL = tmpURL(stillName)
-                    guard (try? stillData.write(to: stillURL)) != nil else {
-                        completion(.failure(BurnEngineError.stillFailed("静帧落盘失败")))
-                        return
-                    }
-                    let report = selfCheck(stillData: stillData, videoURL: finalVideo,
-                                           identifier: identifier)
-                    completion(.success(BurnOutput(stillURL: stillURL, videoURL: finalVideo,
-                                                   identifier: identifier, report: report)))
                 }
             }
         }
     }
+
+    /// ③ 出静帧 + 自检
+    private static func finish(videoURL: URL, identifier: String,
+                               completion: @escaping (Result<BurnOutput, Error>) -> Void) {
+        // 关键：静帧从「已烧字的成片」抽，尺寸/朝向与视频天然一致，
+        // 避免「图片竖屏 1080x1440、视频横屏 1920x1080」这种配对不一致。
+        guard let frame = stillFrame(videoURL: videoURL) else {
+            completion(.failure(BurnEngineError.stillFailed("无法解码视频帧")))
+            return
+        }
+        var notes: [String] = []
+        guard let made = makeStill(frame, identifier: identifier, notes: &notes) else {
+            completion(.failure(BurnEngineError.stillFailed(notes.joined(separator: " / "))))
+            return
+        }
+        let stillURL = tmpURL(made.1)
+        guard (try? made.0.write(to: stillURL)) != nil else {
+            completion(.failure(BurnEngineError.stillFailed("静帧落盘失败")))
+            return
+        }
+        let report = selfCheck(stillData: made.0, videoURL: videoURL, identifier: identifier)
+        completion(.success(BurnOutput(stillURL: stillURL, videoURL: videoURL,
+                                       identifier: identifier, report: report)))
+    }
+
+    /// 依次尝试多个导出预设，成功即返回
+    private static func export(source asset: AVAsset, composition: AVVideoComposition,
+                               duration: CMTime, presets: [String],
+                               completion: @escaping (Result<URL, Error>) -> Void) {
+        var queue = presets
+        var lastReason = "没有可用的导出预设"
+
+        func attempt() {
+            guard !queue.isEmpty else {
+                completion(.failure(BurnEngineError.writerFailed(lastReason)))
+                return
+            }
+            let preset = queue.removeFirst()
+            guard let exporter = AVAssetExportSession(asset: asset, presetName: preset) else {
+                attempt()
+                return
+            }
+            let url = tmpURL("intermediate.mov")
+            exporter.outputURL = url
+            exporter.outputFileType = .mov
+            exporter.videoComposition = composition
+            exporter.timeRange = CMTimeRange(start: .zero, duration: duration)
+            exporter.exportAsynchronously {
+                if exporter.status == .completed {
+                    completion(.success(url))
+                } else {
+                    lastReason = exporter.error?.localizedDescription
+                        ?? "status=\(exporter.status.rawValue)"
+                    attempt()
+                }
+            }
+        }
+        attempt()
+    }
+
 
     // MARK: - 视频：无损重封装 + 配对元数据
 
