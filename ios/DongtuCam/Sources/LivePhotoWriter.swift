@@ -62,39 +62,55 @@ enum LivePhotoWriter {
             return
         }
 
-        authorize(addOnly: true) { allowed in
-            guard allowed else {
-                Diagnostics.mark("save.denied")
-                completion(.failure(LivePhotoWriterError.denied))
-                return
-            }
+        authorizeForLive { level in
+            Diagnostics.mark("save.auth-\(level)")
             // 写库前先让系统读一遍（纯读，不写库）：能解成 PHLivePhoto
-            // 说明配对元数据没问题，剩下的只是投递方式
+            // 说明配对标识符没问题，剩下的只是投递方式
             preflight(still: still, video: video) { note in
-                commit(still: still, video: video, note: note, report: report,
-                       completion: completion)
+                attempt(still: still, video: video, note: note, report: report,
+                        index: 1, moveFile: false) { first in
+                    if case .success = first {
+                        completion(first)
+                        return
+                    }
+                    // 第二种组合：让系统直接把文件搬进相册（省一次大块拷贝）。
+                    // 两种都失败就是真不行了，交给上层降级成「照片 + 视频分开存」。
+                    Diagnostics.mark("save.retry")
+                    attempt(still: still, video: video, note: note, report: report,
+                            index: 2, moveFile: true) { second in
+                        completion(second)
+                    }
+                }
             }
         }
     }
 
-    private static func commit(still: URL, video: URL, note: String, report: String,
-                               completion: @escaping (Result<LivePhotoOutcome, Error>) -> Void) {
-        Diagnostics.mark("save.commit")
+    /// 提交一次配对。
+    /// - Parameters:
+    ///   - index: 第几次尝试（只用于在日志里区分）
+    ///   - moveFile: 是否让系统把文件搬进相册（第二次尝试才用）
+    private static func attempt(still: URL, video: URL, note: String, report: String,
+                                index: Int, moveFile: Bool,
+                                completion: @escaping (Result<LivePhotoOutcome, Error>) -> Void) {
+        Diagnostics.mark("save.commit\(index)")
         var created: String?
         PHPhotoLibrary.shared().performChanges {
             let creation = PHAssetCreationRequest.forAsset()
+            // 带上创建时间：个别系统版本会因为没有时间而判资源无效
+            creation.creationDate = Date()
 
-            // 两个资源必须同一种投递方式（都用 URL）。混投会被 PhotoKit 直接拒绝。
             let photoOptions = PHAssetResourceCreationOptions()
             photoOptions.originalFilename = "IMG_DTC.HEIC"
-            photoOptions.shouldMoveFile = false
+            // 显式声明类型：只靠后缀去猜，猜错就是「资源无效」
+            photoOptions.uniformTypeIdentifier = "public.heic"
+            photoOptions.shouldMoveFile = moveFile
 
             let videoOptions = PHAssetResourceCreationOptions()
             videoOptions.originalFilename = "IMG_DTC.MOV"
-            // 不搬走：暂存目录里的这一对文件是「崩溃也能补存」的安全网，
-            // 提交一旦失败还要靠它们降级重来。视频只有几 MB，拷一份不值得冒险。
-            videoOptions.shouldMoveFile = false
+            videoOptions.uniformTypeIdentifier = "com.apple.quicktime-movie"
+            videoOptions.shouldMoveFile = moveFile
 
+            // 两个资源必须同一种投递方式（都用 URL），混投会被 PhotoKit 直接拒绝
             creation.addResource(with: .photo, fileURL: still, options: photoOptions)
             creation.addResource(with: .pairedVideo, fileURL: video, options: videoOptions)
 
@@ -120,8 +136,8 @@ enum LivePhotoWriter {
             }
             let nsError = error as NSError?
             let code = nsError?.code ?? -1
-            // 错误码先进面包屑：文件里出现 save.fail-3303 这种，就是直接判据
-            Diagnostics.mark("save.fail-\(code)")
+            // 错误码进面包屑：文件里出现 save.fail1-3303 这种就是直接判据
+            Diagnostics.mark("save.fail\(index)-\(code)")
             var message = "实况提交被系统拒绝（\(nsError?.domain ?? "?") \(code)）"
             if !note.isEmpty { message += " · \(note)" }
             if !report.isEmpty { message += " · \(String(report.suffix(120)))" }
@@ -224,6 +240,28 @@ enum LivePhotoWriter {
     }
 
     // MARK: - 权限
+
+    /// 配对写入优先要「完整相册访问」（不只是「添加照片」）。
+    ///
+    /// 两个理由：
+    ///   1. PhotoKit 写完配对资源后要回读校验，只有 addOnly 权限时更容易被直接拒绝；
+    ///   2. 有完整权限才能回读确认「到底存成实况没有」，否则我们只能瞎猜。
+    /// 拿不到就退回 addOnly 继续尝试，不阻断（降级成照片 + 视频仍然只要 addOnly）。
+    private static func authorizeForLive(_ done: @escaping (String) -> Void) {
+        let full = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        if full == .authorized || full == .limited {
+            done("full")
+            return
+        }
+        if full == .notDetermined {
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { next in
+                let ok = (next == .authorized || next == .limited)
+                DispatchQueue.main.async { done(ok ? "full" : "addonly") }
+            }
+            return
+        }
+        done("addonly")
+    }
 
     private static func authorize(addOnly: Bool, _ done: @escaping (Bool) -> Void) {
         let level: PHAccessLevel = addOnly ? .addOnly : .readWrite
