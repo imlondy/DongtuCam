@@ -147,147 +147,135 @@ enum BurnEngine {
     }
 
     /// 无损重封装 + 写入配对元数据。不解码、不重编码。
+    ///
+    /// ## v18 的两条铁律（都是拿真机闪退换来的教训）
+    ///
+    /// 1. **视频轨-only**：原生 Live Photo 的配对视频本来就没有音轨，
+    ///    所以只读视频轨——一个 reader、一个 output、一个队列，零共享状态。
+    ///    v16 曾给同一素材建两个 AVAssetReader（视频/音频各一），真机必崩；
+    ///    v10~v14 单 reader 双 output 双队列并发是数据竞争，也不可靠。
+    /// 2. **全程后台线程**：AVAsset 同步加载、reader/writer 搭建、startReading
+    ///    全部离开主线程（v14 的模型）。v16 重写后这段跑回了主线程，真机持续闪退。
     private static func remux(videoURL: URL, identifier: String,
                               completion: @escaping (Result<URL, Error>) -> Void) {
-        Diagnostics.mark("burn.remux")
-        let asset = AVAsset(url: videoURL)
-        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
-            completion(.failure(BurnEngineError.noVideoTrack))
-            return
-        }
-        let audioTrack = asset.tracks(withMediaType: .audio).first
-        let outURL = tmpURL("live.mov")
-
-        // 时长的兜底：个别机型刚停止录制时 duration 还是 indefinite，
-        // 直接拿它去建 timeRange 会抛异常
-        var duration = asset.duration
-        if !duration.isNumeric || duration.seconds <= 0 {
-            duration = CMTime(seconds: 5, preferredTimescale: 600)
-        }
-
-        do {
-            // 视频 reader
-            let reader = try AVAssetReader(asset: asset)
-            let videoOut = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
-            guard reader.canAdd(videoOut) else {
-                completion(.failure(BurnEngineError.writerFailed("无法读取视频轨")))
-                return
-            }
-            reader.add(videoOut)
-
-            // 音频用**另建的一个 reader**：同一个 reader 的两个 output
-            // 不允许从两个队列并发 copyNextSampleBuffer（不是线程安全的）。
-            var audioReader: AVAssetReader?
-            var audioOut: AVAssetReaderTrackOutput?
-            if let audioTrack, let r = try? AVAssetReader(asset: asset) {
-                let o = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
-                if r.canAdd(o) {
-                    r.add(o)
-                    audioReader = r
-                    audioOut = o
+        DispatchQueue.global(qos: .userInitiated).async {
+            Diagnostics.mark("burn.remux")
+            let asset = AVAsset(url: videoURL)
+            guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+                Diagnostics.mark("burn.remux-notrack")
+                DispatchQueue.main.async {
+                    completion(.failure(BurnEngineError.noVideoTrack))
                 }
-            }
-
-            let writer = try AVAssetWriter(outputURL: outURL, fileType: .mov)
-            writer.metadata = [contentIdentifierItem(identifier)]
-
-            let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
-            videoInput.expectsMediaDataInRealTime = false
-
-            var audioInput: AVAssetWriterInput?
-            if audioOut != nil {
-                let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
-                ai.expectsMediaDataInRealTime = false
-                // 必须逐个确认能否添加：add 一个不被接受的输入会抛 ObjC 异常（闪退）
-                if writer.canAdd(ai) { audioInput = ai }
-            }
-
-            let metadataInput = try stillImageTimeInput()
-            metadataInput.expectsMediaDataInRealTime = false
-            let adaptor = AVAssetWriterInputMetadataAdaptor(assetWriterInput: metadataInput)
-
-            guard writer.canAdd(videoInput), writer.canAdd(metadataInput) else {
-                completion(.failure(BurnEngineError.writerFailed("无法添加写入输入")))
                 return
             }
-            writer.add(videoInput)
-            if let audioInput { writer.add(audioInput) }
-            writer.add(metadataInput)
+            let outURL = tmpURL("live.mov")
 
-            guard writer.startWriting() else {
-                let reason = writer.error?.localizedDescription ?? "startWriting 失败"
-                completion(.failure(BurnEngineError.writerFailed(reason)))
-                return
+            // 时长的兜底：个别机型刚停止录制时 duration 还是 indefinite，
+            // 直接拿它去建 timeRange 会抛异常
+            var duration = asset.duration
+            if !duration.isNumeric || duration.seconds <= 0 {
+                duration = CMTime(seconds: 5, preferredTimescale: 600)
             }
-            writer.startSession(atSourceTime: .zero)
-            guard reader.startReading() else {
-                writer.cancelWriting()
-                completion(.failure(BurnEngineError.writerFailed("startReading 失败")))
-                return
-            }
-            _ = audioReader?.startReading()
-            Diagnostics.mark("burn.remux-writing")
 
-            // 轨道级 still-image-time：必须写在第一个视频样本之前，值 0xFF(=SInt8 -1)
-            let stillItem = AVMutableMetadataItem()
-            stillItem.key = "com.apple.quicktime.still-image-time" as NSString
-            stillItem.keySpace = .quickTimeMetadata
-            stillItem.value = NSNumber(value: -1)
-            stillItem.dataType = kCMMetadataBaseDataType_SInt8 as String
-            adaptor.append(AVTimedMetadataGroup(
-                items: [stillItem],
-                timeRange: CMTimeRange(start: .zero, duration: duration)))
-            metadataInput.markAsFinished()
-
-            let group = DispatchGroup()
-
-            group.enter()
-            var videoDone = false
-            videoInput.requestMediaDataWhenReady(on: DispatchQueue(label: "dtc.remux.video")) {
-                if videoDone { return }
-                while videoInput.isReadyForMoreMediaData {
-                    guard let sample = videoOut.copyNextSampleBuffer(),
-                          videoInput.append(sample) else {
-                        videoDone = true
-                        videoInput.markAsFinished()
-                        group.leave()
-                        return
+            do {
+                let reader = try AVAssetReader(asset: asset)
+                let videoOut = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
+                guard reader.canAdd(videoOut) else {
+                    DispatchQueue.main.async {
+                        completion(.failure(BurnEngineError.writerFailed("无法读取视频轨")))
                     }
+                    return
                 }
-            }
+                reader.add(videoOut)
 
-            if let audioInput, let audioOut {
+                let writer = try AVAssetWriter(outputURL: outURL, fileType: .mov)
+                writer.metadata = [contentIdentifierItem(identifier)]
+
+                let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
+                videoInput.expectsMediaDataInRealTime = false
+
+                let metadataInput = try stillImageTimeInput()
+                metadataInput.expectsMediaDataInRealTime = false
+                let adaptor = AVAssetWriterInputMetadataAdaptor(assetWriterInput: metadataInput)
+
+                guard writer.canAdd(videoInput), writer.canAdd(metadataInput) else {
+                    DispatchQueue.main.async {
+                        completion(.failure(BurnEngineError.writerFailed("无法添加写入输入")))
+                    }
+                    return
+                }
+                writer.add(videoInput)
+                writer.add(metadataInput)
+
+                Diagnostics.mark("burn.remux-startw")
+                guard writer.startWriting() else {
+                    let reason = writer.error?.localizedDescription ?? "startWriting 失败"
+                    Diagnostics.mark("burn.remux-startw-failed")
+                    DispatchQueue.main.async {
+                        completion(.failure(BurnEngineError.writerFailed(reason)))
+                    }
+                    return
+                }
+                writer.startSession(atSourceTime: .zero)
+                guard reader.startReading() else {
+                    writer.cancelWriting()
+                    Diagnostics.mark("burn.remux-startread-failed")
+                    DispatchQueue.main.async {
+                        completion(.failure(BurnEngineError.writerFailed("startReading 失败")))
+                    }
+                    return
+                }
+                Diagnostics.mark("burn.remux-writing")
+
+                // 轨道级 still-image-time：必须写在第一个视频样本之前，值 0xFF(=SInt8 -1)
+                let stillItem = AVMutableMetadataItem()
+                stillItem.key = "com.apple.quicktime.still-image-time" as NSString
+                stillItem.keySpace = .quickTimeMetadata
+                stillItem.value = NSNumber(value: -1)
+                stillItem.dataType = kCMMetadataBaseDataType_SInt8 as String
+                adaptor.append(AVTimedMetadataGroup(
+                    items: [stillItem],
+                    timeRange: CMTimeRange(start: .zero, duration: duration)))
+                metadataInput.markAsFinished()
+                Diagnostics.mark("burn.remux-meta-ok")
+
+                let group = DispatchGroup()
                 group.enter()
-                var audioDone = false
-                audioInput.requestMediaDataWhenReady(on: DispatchQueue(label: "dtc.remux.audio")) {
-                    if audioDone { return }
-                    while audioInput.isReadyForMoreMediaData {
-                        guard let sample = audioOut.copyNextSampleBuffer(),
-                              audioInput.append(sample) else {
-                            audioDone = true
-                            audioInput.markAsFinished()
+                var videoDone = false
+                videoInput.requestMediaDataWhenReady(on: DispatchQueue(label: "dtc.remux.video")) {
+                    if videoDone { return }
+                    while videoInput.isReadyForMoreMediaData {
+                        guard let sample = videoOut.copyNextSampleBuffer(),
+                              videoInput.append(sample) else {
+                            videoDone = true
+                            videoInput.markAsFinished()
                             group.leave()
                             return
                         }
                     }
                 }
-            }
 
-            group.notify(queue: .main) {
-                writer.finishWriting {
-                    DispatchQueue.main.async {
-                        if writer.status == .completed {
-                            completion(.success(outURL))
-                        } else {
-                            let reason = writer.error?.localizedDescription
-                                ?? "status=\(writer.status.rawValue)"
-                            completion(.failure(BurnEngineError.writerFailed(reason)))
+                group.notify(queue: .main) {
+                    Diagnostics.mark("burn.remux-samples-done")
+                    writer.finishWriting {
+                        DispatchQueue.main.async {
+                            if writer.status == .completed {
+                                completion(.success(outURL))
+                            } else {
+                                let reason = writer.error?.localizedDescription
+                                    ?? "status=\(writer.status.rawValue)"
+                                Diagnostics.mark("burn.remux-finish-failed")
+                                completion(.failure(BurnEngineError.writerFailed(reason)))
+                            }
                         }
                     }
                 }
+            } catch {
+                Diagnostics.mark("burn.remux-throw")
+                DispatchQueue.main.async {
+                    completion(.failure(error))
+                }
             }
-        } catch {
-            completion(.failure(error))
         }
     }
 
@@ -369,7 +357,7 @@ enum BurnEngine {
                                                          "public.heic" as CFString, 1, nil) else {
             return nil
         }
-        var props: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.96]
+        var props: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.98]
         for (key, value) in extra { props[key] = value }
         CGImageDestinationAddImage(dest, image, props as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
