@@ -60,19 +60,22 @@ enum BurnEngine {
 
     // MARK: - 静帧
 
-    /// 静帧画布尺寸：**显示方向的帧再放大 1.5 倍**。
+    /// 静帧画布尺寸：**显示方向的帧再放大 2 倍**。
     ///
-    /// 为什么要放大：静帧是用户唯一能看清的东西，而文字字号是按画布宽度换算的。
-    /// 画布只有视频那么大（1080 宽）时文字约 41px，手机屏宽 1170px，
-    /// 等于把字**放大 8%** 显示 —— 边缘立刻发毛。1.5 倍画布（1620 宽）后，
-    /// 文字按 62px 渲染，缩到屏幕上反而是缩小，边缘干净。
+    /// 为什么要放大到 2 倍（v21 的 1.5 倍还不够）：
+    /// 相机录的是 3:4，而手机屏是 9:16 —— 照片/动图在相册和抖音里按
+    /// **aspectFill 铺满全屏**，横向要放大 `屏宽像素 / 画面宽` 倍。
+    /// 以 3:4 为例，放大约 1.6~1.8 倍。
+    /// 画布只有视频那么大（1080 宽）时，字等于被放大 1.8 倍显示 → 怎么都发毛；
+    /// 1.5 倍（1620 宽）仍会被放大约 1.2 倍 → 还是毛；
+    /// **2 倍（2160 宽）超过放大后的屏幕像素数（约 1920）→ 显示时是缩小，边缘最锐利。**
     /// 原生实况本来就是这样：照片分辨率远高于配对视频。
-    /// 上限 2160 宽，防止大底机型把内存和编码时间顶穿。
+    /// 上限 2160，防止大底机型把内存和编码时间顶穿。
     static func stillCanvasSize(for frame: CGImage) -> CGSize {
         let w = CGFloat(frame.width)
         let h = CGFloat(frame.height)
         guard w > 1, h > 1 else { return CGSize(width: max(w, 2), height: max(h, 2)) }
-        var scale: CGFloat = 1.5
+        var scale: CGFloat = 2.0
         if w * scale > 2160 { scale = 2160 / w }
         if scale < 1 { scale = 1 }
         return CGSize(width: (w * scale).rounded(), height: (h * scale).rounded())
@@ -160,19 +163,46 @@ enum BurnEngine {
 
     // MARK: - 视频
 
-    /// 视频段：相机原片**无损重封装** + 注入配对元数据。不解码、不重编码。
+    /// 视频段：**逐帧压字 + 转正**，失败则降级为无损重封装。
     ///
-    /// 这是 v10~v14 在真机上验证过唯一稳定出「动图」的路。逐帧压字通道
-    /// （VideoBurner，v15/v16）在真机上持续闪退，v17 起整体移除：
-    /// 文字只印在静帧上，动图播放时画面里没有字。
-    static func makeVideo(source: URL, identifier: String,
+    /// v22 起文字不再只印在封面上 —— 动图播放时画面里也有字。
+    /// v15/v16 的逐帧通道曾让真机持续崩溃，那是一套 Metal + 多 reader 的实现；
+    /// 现在的 `FrameBurner` 改成了 CPU + 单队列 + 缓冲池复用（见该文件的说明）。
+    ///
+    /// 压字失败不影响出片：降级到 `remux`（原样无损封装，只是画面里没有字），
+    /// 实况配对、方向修正、时长都照旧。
+    static func makeVideo(source: URL, lines: [String],
+                          previewFontPt: CGFloat, screenWidthPt: CGFloat,
+                          identifier: String,
                           completion: @escaping (Result<VideoOutput, Error>) -> Void) {
-        remux(videoURL: source, identifier: identifier) { result in
-            switch result {
-            case .failure(let error):
-                completion(.failure(error))
-            case .success(let url):
-                completion(.success(VideoOutput(url: url, mode: "passthrough")))
+        DispatchQueue.global(qos: .userInitiated).async {
+            if !lines.isEmpty {
+                do {
+                    let url = try FrameBurner.run(FrameBurner.Config(
+                        source: source,
+                        lines: lines,
+                        previewFontPt: previewFontPt,
+                        screenWidthPt: screenWidthPt,
+                        identifier: identifier))
+                    DispatchQueue.main.async {
+                        completion(.success(VideoOutput(url: url, mode: "burn")))
+                    }
+                    return
+                } catch {
+                    // 压字失败不是终点：无字动图也比一张图片强
+                    Diagnostics.mark("burnV.failed-fallback")
+                }
+            } else {
+                Diagnostics.mark("burnV.skipped-nolines")
+            }
+
+            remux(videoURL: source, identifier: identifier) { result in
+                switch result {
+                case .failure(let error):
+                    completion(.failure(error))
+                case .success(let url):
+                    completion(.success(VideoOutput(url: url, mode: "passthrough")))
+                }
             }
         }
     }
@@ -225,6 +255,10 @@ enum BurnEngine {
 
                 let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
                 videoInput.expectsMediaDataInRealTime = false
+                // **方向的关键**：直通写入 sample buffer 时，轨道方向不会跟着 sample 走，
+                // 必须显式把源轨的 preferredTransform 带过去。漏掉这一行，
+                // 竖拍的成片在播放器里就会被当成横向（v21 的「正拍变横屏」）。
+                videoInput.transform = videoTrack.preferredTransform
 
                 let metadataInput = try stillImageTimeInput()
                 metadataInput.expectsMediaDataInRealTime = false
@@ -311,7 +345,7 @@ enum BurnEngine {
         }
     }
 
-    private static func contentIdentifierItem(_ identifier: String) -> AVMetadataItem {
+    static func contentIdentifierItem(_ identifier: String) -> AVMetadataItem {
         let item = AVMutableMetadataItem()
         item.key = "com.apple.quicktime.content.identifier" as NSString
         item.keySpace = .quickTimeMetadata
@@ -322,7 +356,7 @@ enum BurnEngine {
 
     /// 原生实况的配对视频都带拍摄时间；缺了它，个别系统版本会把它当成
     /// 「来源不明的片段」，进相册后排序也会乱。
-    private static func creationDateItem() -> AVMetadataItem {
+    static func creationDateItem() -> AVMetadataItem {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         let item = AVMutableMetadataItem()
@@ -334,7 +368,7 @@ enum BurnEngine {
     }
 
     /// still-image-time 的写入输入：必须带 SInt8 的 sourceFormatHint，否则运行期崩溃
-    private static func stillImageTimeInput() throws -> AVAssetWriterInput {
+    static func stillImageTimeInput() throws -> AVAssetWriterInput {
         let spec: [CFString: Any] = [
             kCMMetadataFormatDescriptionMetadataSpecificationKey_Identifier:
                 "mdta/com.apple.quicktime.still-image-time",
