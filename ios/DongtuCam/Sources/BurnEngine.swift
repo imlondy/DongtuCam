@@ -186,7 +186,8 @@ enum BurnEngine {
             if audioOut != nil {
                 let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
                 ai.expectsMediaDataInRealTime = false
-                audioInput = ai
+                // 必须逐个确认能否添加：直接 add 一个不被接受的输入会抛 ObjC 异常（闪退）
+                if writer.canAdd(ai) { audioInput = ai }
             }
 
             let metadataInput = try stillImageTimeInput()
@@ -310,8 +311,9 @@ enum BurnEngine {
         let asset = AVAsset(url: videoURL)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
-        generator.requestedTimeToleranceBefore = .zero
-        generator.requestedTimeToleranceAfter = .zero
+        // 容差给宽松：某些机型首帧不在 0.1s 的精确位置上，零容差会直接取不到图
+        generator.requestedTimeToleranceBefore = .positiveInfinity
+        generator.requestedTimeToleranceAfter = .positiveInfinity
         return try? generator.copyCGImage(at: CMTime(value: 1, timescale: 10),
                                          actualTime: nil)
     }
