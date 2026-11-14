@@ -13,20 +13,38 @@ enum LivePhotoWriterError: LocalizedError {
     }
 }
 
-/// 唯一能消除「最后一跳」的地方：
-/// 在同一次 performChanges 里把 .photo 与 .pairedVideo 一起提交，
-/// 由 iOS 自己完成实况照片配对（系统生成 ContentIdentifier / still-image-time，
-/// 不再需要手写任何元数据，也不需要爱思助手 / intoLive）。
+/// 在同一次 performChanges 里把 .photo 与 .pairedVideo 一起提交，由 iOS 完成实况照片配对。
+///
+/// 三个必须同时满足的点（缺任一都会 `PHPhotosErrorDomain 3302`）：
+///   1. 两个资源在同一个 performChanges 闭包里添加；
+///   2. 资源类型必须是 .photo + .pairedVideo；
+///   3. 两个资源的 uniformTypeIdentifier 都显式设为 com.apple.live-photo
+///      （系统靠它识别为 Live Photo 资源，不设会被当成「普通照片 + 普通视频」）。
+///
+/// 另外 .photo 用 data 提交（不是 fileURL）——用 fileURL 传 HEIC 时 PhotoKit
+/// 解析资源 URL 易失败（错误里带 _PHResourceUrlsErrorKey）。
 enum LivePhotoWriter {
+    private static let livePhotoUTI = "com.apple.live-photo"
+
     static func save(still: URL, video: URL,
                      completion: @escaping (Result<Void, Error>) -> Void) {
+        guard let stillData = try? Data(contentsOf: still) else {
+            completion(.failure(LivePhotoWriterError.failed("无法读取静帧文件")))
+            return
+        }
+
         let commit = {
             PHPhotoLibrary.shared().performChanges {
                 let creation = PHAssetCreationRequest.forAsset()
-                creation.addResource(with: .photo, fileURL: still, options: nil)
-                let options = PHAssetResourceCreationOptions()
-                options.shouldMoveFile = true
-                creation.addResource(with: .pairedVideo, fileURL: video, options: options)
+
+                let photoOptions = PHAssetResourceCreationOptions()
+                photoOptions.uniformTypeIdentifier = livePhotoUTI
+                creation.addResource(with: .photo, data: stillData, options: photoOptions)
+
+                let videoOptions = PHAssetResourceCreationOptions()
+                videoOptions.uniformTypeIdentifier = livePhotoUTI
+                videoOptions.shouldMoveFile = true
+                creation.addResource(with: .pairedVideo, fileURL: video, options: videoOptions)
             } completionHandler: { success, error in
                 DispatchQueue.main.async {
                     if success {
