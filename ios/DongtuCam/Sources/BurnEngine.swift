@@ -4,12 +4,16 @@ import CoreImage
 import UIKit
 import ImageIO
 
-struct BurnOutput {
-    let stillURL: URL
-    let videoURL: URL
-    let identifier: String
-    /// 自检结果（如 "still=heic img17=ok movId=ok sit=ok"），写库失败时会带进错误提示
+struct StillOutput {
+    let url: URL
+    let data: Data
     let report: String
+}
+
+struct VideoOutput {
+    let url: URL
+    /// 走了哪条路：burn=on / burn=skip(原因) / passthrough
+    let mode: String
 }
 
 enum BurnEngineError: LocalizedError {
@@ -28,59 +32,43 @@ enum BurnEngineError: LocalizedError {
     }
 }
 
-/// 产出一对能配成实况照片的文件：带文字的 HEIC 静帧 + 带文字的 MOV 视频。
+/// 把「原始首帧 + 文字层」做成 HEIC 静帧，把相机原片做成配好元数据的视频。
 ///
-/// ## v15：文案重新回到动图里，但是「钉住」的
+/// ## v16 的两个结构性改动
 ///
-/// v14 为了根治模糊与抖动，把文字完全从视频里拿掉，结果动图播放时看不到字。
-/// v15 用一条独立通道把字补回去（`VideoBurner`）：
-///   AVAssetReader 出帧 → CIContext 把**同一张静态图层**贴到同一坐标 → AVAssetWriter 写帧
-/// 全程没有 `AVAssetExportSession`、没有 `applyingCIFiltersWithHandler`，
-/// 也就是 v11~v13 每轮闪退的那条「系统托管逐帧会话」根本不存在了。
-/// 文字位置逐帧完全一致，所以播放时字是钉在画面上的，不会跟着镜头晃。
+/// 1. **拆成两个独立步骤**（`makeStill` / `makeVideo`）。
+///    v15 是一次调用做完两件事，中间崩溃则什么都不剩。现在每做完一步就把产物
+///    落进 `ShotStore` 的暂存目录，配合崩溃后自动补存，任何一步挂掉都不会白拍。
 ///
-/// 同时保留上一版最重要的一条：**静帧仍然用原始首帧 1:1 合成**，
-/// 不经过任何视频编解码往返，所以封面上的字依旧清晰。
-/// 压字失败会自动退回无损重封装，不会让这一拍白费。
+/// 2. **修掉 AVAssetReader 的并发读取**。
+///    自 v10 起，remux 与压字都是「一个 reader 挂视频+音频两个 output，
+///    分别用两个队列调用 copyNextSampleBuffer」。AVAssetReader **不是线程安全**的，
+///    这种写法属于数据竞争：大部分时候没事，偶发就整进程崩，且崩在哪完全随机
+///    ——这正是「每个版本都闪退、每次位置都不一样」最合理的解释。
+///    现在视频与音频各用一个独立 reader，彻底不存在共享状态。
 ///
-/// ## v14 的后半段改动（仍然有效）
+/// ## 静帧为什么清晰
+/// 文字层按 1:1 叠在原始首帧上（两者同像素尺寸，绝不缩放），直接编码 HEIC；
+/// 不经过任何视频编解码往返，所以封面上的字是像素级干净的。
 ///
-/// 1. **文字只合成到静帧上，视频一点不碰。**
-///    以前文字是烧进视频再抽一帧当静帧，于是：字跟着画面/播放动效一起动，
-///    而且一路经历「CIImage 缩放 → HEVC 编码 → 解码抽帧 → HEIC 编码」，
-///    每一环都是丢细节，最后当然是一团糊。现在静帧是
-///    「原始首帧 + CoreGraphics 文字层」一次性合成，文字按像素 1:1 绘制，
-///    没有任何重采样，边缘是干净的抗锯齿。
-///
-/// 2. **去掉 AVAssetExportSession + applyingCIFiltersWithHandler 整条链路。**
-///    那是 v11~v13 每轮闪退的共同起点（VideoToolbox 编码 + CI 每帧回调，
-///    1080p 5 秒的峰值内存和内部断言都不受我们控制）。现在视频走
-///    `AVAssetReader → AVAssetWriter` 的 passthrough，不解码、不重编码，
-///    只是重新封装并写入两条配对元数据——这一步在 v10 起就稳定。
-///
-/// 实况照片能不能存进相册，取决于三件事，缺一项就是 PHPhotosErrorDomain 3302：
-///   1. 静帧必须是 **HEIC**，且 iPhone 内部 MakerApple 的 "17" 字段 == 配对标识；
-///   2. 视频的文件级元数据里 com.apple.quicktime.content.identifier == 同一个标识；
-///   3. 视频里必须有一条 timed metadata 轨道 com.apple.quicktime.still-image-time
-///      （值 0xFF，即 SInt8 的 -1），告诉系统封面静帧对应哪一帧。
+/// ## 实况照片能不能存进相册
+/// 取决于三件事，缺一项就是 PHPhotosErrorDomain 3302：
+///   1. 静帧是 HEIC，且 iPhone 内部 MakerApple 的 "17" 字段 == 配对标识；
+///   2. 视频文件级元数据 com.apple.quicktime.content.identifier == 同一标识；
+///   3. 视频里有一条 timed metadata 轨 com.apple.quicktime.still-image-time（0xFF）。
 enum BurnEngine {
-    /// - Parameters:
-    ///   - source: 相机原始录制文件（未做任何处理）
-    ///   - frame: 已转正的首帧，用来做静帧底图（尺寸 = 成片尺寸）
-    ///   - overlay: 与 frame 同尺寸的透明文字层
-    ///   - burnIntoVideo: 是否把同一张文字层也逐帧压进视频（动图播放时也能看到字，位置固定）。
-    ///     走 `VideoBurner` 的 pixel-buffer 通路，失败会自动退化成无损重封装，
-    ///     不会因为这条路出问题而让这一拍白费。
-    static func compose(source: URL, frame: CGImage, overlay: CGImage,
-                        burnIntoVideo: Bool = true,
-                        completion: @escaping (Result<BurnOutput, Error>) -> Void) {
-        let identifier = UUID().uuidString
 
-        // 重活全部离开主线程：合成 + HEIC 编码 + 封装，主线程只负责刷 UI
+    // MARK: - 静帧
+
+    /// - Parameters:
+    ///   - frame: 已转正的首帧（= 成片尺寸）
+    ///   - overlay: 同尺寸透明文字层；为 nil 时输出无字静帧（文案环节失败时的降级）
+    static func makeStill(frame: CGImage, overlay: CGImage?, identifier: String,
+                          completion: @escaping (Result<StillOutput, Error>) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             var notes: [String] = []
-            Diagnostics.mark("burn.flatten")
 
+            Diagnostics.mark("burn.flatten")
             let composed = autoreleasepool { flatten(frame: frame, overlay: overlay) }
             guard let composed else {
                 DispatchQueue.main.async {
@@ -90,100 +78,32 @@ enum BurnEngine {
             }
 
             Diagnostics.mark("burn.heic")
-            guard let made = makeStill(composed, identifier: identifier, notes: &notes) else {
+            guard let made = autoreleasepool(invoking: {
+                makeStillData(composed, identifier: identifier, notes: &notes)
+            }) else {
                 DispatchQueue.main.async {
                     completion(.failure(BurnEngineError.stillFailed(notes.joined(separator: " / "))))
                 }
                 return
             }
-            let stillData = made.0
-            let stillName = made.1
 
-            let stillURL = tmpURL(stillName)
-            guard (try? stillData.write(to: stillURL)) != nil else {
+            let url = tmpURL("still.heic")
+            guard (try? made.write(to: url)) != nil else {
                 DispatchQueue.main.async {
                     completion(.failure(BurnEngineError.stillFailed("静帧落盘失败")))
                 }
                 return
             }
-
-            // 视频：默认把文字层逐帧压进画面（动图播放也有字，位置固定）；
-            // 关掉时走原样 passthrough，只注入配对元数据。
-            let videoSize = CGSize(width: frame.width, height: frame.height)
-            finishVideo(source: source, overlay: overlay, renderSize: videoSize,
-                        identifier: identifier, burnIntoVideo: burnIntoVideo) { result in
-                switch result {
-                case .failure(let error):
-                    completion(.failure(error))
-                case .success(let pair):
-                    let finalVideo = pair.url
-                    Diagnostics.mark("burn.remux-ok")
-                    let report = selfCheck(stillData: stillData, stillURL: stillURL,
-                                           videoURL: finalVideo, identifier: identifier)
-                        + " vid=" + pair.mode
-                    completion(.success(BurnOutput(stillURL: stillURL,
-                                                   videoURL: finalVideo,
-                                                   identifier: identifier,
-                                                   report: report)))
-                }
-            }
-        }
-    }
-
-    /// 视频段结果：成片地址 + 走了哪条路（写进自检报告，方便排查）
-    private struct VideoResult {
-        let url: URL
-        let mode: String
-    }
-
-    /// 视频段的入口：先决定「要不要压字」，再统一走 remux 注入配对元数据。
-    ///
-    /// 两条路都收敛到 remux，是为了让**配对元数据只有一份实现**——
-    /// 那部分在 v10 起就稳定，不需要因为换了编码方式再冒一次 3302 的风险。
-    private static func finishVideo(source: URL, overlay: CGImage, renderSize: CGSize,
-                                    identifier: String, burnIntoVideo: Bool,
-                                    completion: @escaping (Result<VideoResult, Error>) -> Void) {
-        func fallbackToPassthrough(_ reason: String) {
-            Diagnostics.mark("burn.video-fallback")
-            remux(videoURL: source, identifier: identifier) { result in
-                switch result {
-                case .failure(let error):
-                    completion(.failure(error))
-                case .success(let url):
-                    completion(.success(VideoResult(url: url, mode: "burn=skip(\(reason))")))
-                }
-            }
-        }
-
-        guard burnIntoVideo else {
-            fallbackToPassthrough("off")
-            return
-        }
-
-        Diagnostics.mark("burn.video")
-        VideoBurner.burn(source: source, overlay: overlay, renderSize: renderSize) { result in
-            switch result {
-            case .failure(let error):
-                // 压字失败不能让这一拍白费：退回无损重封装，照片上仍然有字
-                let reason = (error as? LocalizedError)?.errorDescription ?? "fail"
-                fallbackToPassthrough(String(reason.prefix(28)))
-            case .success(let burned):
-                Diagnostics.mark("burn.video-ok")
-                remux(videoURL: burned, identifier: identifier) { remuxResult in
-                    switch remuxResult {
-                    case .failure(let error):
-                        completion(.failure(error))
-                    case .success(let url):
-                        try? FileManager.default.removeItem(at: burned)
-                        completion(.success(VideoResult(url: url, mode: "burn=on")))
-                    }
-                }
+            Diagnostics.mark("burn.still-ok")
+            DispatchQueue.main.async {
+                completion(.success(StillOutput(url: url, data: made,
+                                                report: notes.joined(separator: " / "))))
             }
         }
     }
 
     /// 把首帧与文字层压成一张不透明位图（两者同尺寸，绝不缩放）
-    private static func flatten(frame: CGImage, overlay: CGImage) -> CGImage? {
+    private static func flatten(frame: CGImage, overlay: CGImage?) -> CGImage? {
         let width = frame.width
         let height = frame.height
         guard width > 1, height > 1 else { return nil }
@@ -200,13 +120,65 @@ enum BurnEngine {
             ctx.fill(CGRect(origin: .zero, size: size))
             UIImage(cgImage: frame).draw(in: CGRect(origin: .zero, size: size))
             // draw(_:in:) 在 1:1 的矩形里是像素直拷，不会引入模糊
-            UIImage(cgImage: overlay).draw(in: CGRect(origin: .zero, size: size))
+            if let overlay {
+                UIImage(cgImage: overlay).draw(in: CGRect(origin: .zero, size: size))
+            }
         }
         return image.cgImage
     }
 
-    // MARK: - 视频：无损重封装 + 配对元数据
+    // MARK: - 视频
 
+    /// 视频段入口：压字（可选）→ 注入配对元数据。
+    ///
+    /// 两条路都收敛到 `remux`，让**配对元数据只有一份实现**——
+    /// 那部分在 v10 起就稳定，不因换了编码方式再冒一次 3302 的风险。
+    static func makeVideo(source: URL, overlay: CGImage?, renderSize: CGSize,
+                          identifier: String, burnIntoVideo: Bool,
+                          completion: @escaping (Result<VideoOutput, Error>) -> Void) {
+        guard burnIntoVideo, let overlay else {
+            remuxPassthrough(source: source, identifier: identifier,
+                             mode: "passthrough", completion: completion)
+            return
+        }
+        Diagnostics.mark("burn.video")
+        VideoBurner.burn(source: source, overlay: overlay, renderSize: renderSize) { result in
+            switch result {
+            case .failure(let error):
+                // 压字失败不能让这一拍白费：退回无损重封装，照片上仍然有字
+                let reason = (error as? LocalizedError)?.errorDescription ?? "fail"
+                remuxPassthrough(source: source, identifier: identifier,
+                                 mode: "burn=skip(\(String(reason.prefix(24))))",
+                                 completion: completion)
+            case .success(let burned):
+                Diagnostics.mark("burn.video-ok")
+                remux(videoURL: burned, identifier: identifier) { remuxResult in
+                    switch remuxResult {
+                    case .failure(let error):
+                        try? FileManager.default.removeItem(at: burned)
+                        completion(.failure(error))
+                    case .success(let url):
+                        try? FileManager.default.removeItem(at: burned)
+                        completion(.success(VideoOutput(url: url, mode: "burn=on")))
+                    }
+                }
+            }
+        }
+    }
+
+    private static func remuxPassthrough(source: URL, identifier: String, mode: String,
+                                         completion: @escaping (Result<VideoOutput, Error>) -> Void) {
+        remux(videoURL: source, identifier: identifier) { result in
+            switch result {
+            case .failure(let error):
+                completion(.failure(error))
+            case .success(let url):
+                completion(.success(VideoOutput(url: url, mode: mode)))
+            }
+        }
+    }
+
+    /// 无损重封装 + 写入配对元数据。不解码、不重编码。
     private static func remux(videoURL: URL, identifier: String,
                               completion: @escaping (Result<URL, Error>) -> Void) {
         Diagnostics.mark("burn.remux")
@@ -226,6 +198,7 @@ enum BurnEngine {
         }
 
         do {
+            // 视频 reader
             let reader = try AVAssetReader(asset: asset)
             let videoOut = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
             guard reader.canAdd(videoOut) else {
@@ -233,11 +206,16 @@ enum BurnEngine {
                 return
             }
             reader.add(videoOut)
+
+            // 音频用**另建的一个 reader**：同一个 reader 的两个 output
+            // 不允许从两个队列并发 copyNextSampleBuffer（不是线程安全的）。
+            var audioReader: AVAssetReader?
             var audioOut: AVAssetReaderTrackOutput?
-            if let audioTrack {
+            if let audioTrack, let r = try? AVAssetReader(asset: asset) {
                 let o = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
-                if reader.canAdd(o) {
-                    reader.add(o)
+                if r.canAdd(o) {
+                    r.add(o)
+                    audioReader = r
                     audioOut = o
                 }
             }
@@ -279,6 +257,7 @@ enum BurnEngine {
                 completion(.failure(BurnEngineError.writerFailed("startReading 失败")))
                 return
             }
+            _ = audioReader?.startReading()
             Diagnostics.mark("burn.remux-writing")
 
             // 轨道级 still-image-time：必须写在第一个视频样本之前，值 0xFF(=SInt8 -1)
@@ -375,21 +354,21 @@ enum BurnEngine {
                                   sourceFormatHint: desc)
     }
 
-    // MARK: - 静帧
+    // MARK: - HEIC 编码
 
     /// 依次尝试三种 HEIC 写入方式，只接受「读回来能拿到 17 号标识」的结果。
     ///
     /// 从零编码 HEIC 时 ImageIO 会静默丢掉 MakerApple，所以主路径是：
     /// 先编出一份合法 HEIC，再从这份已有的 HEIC 源用 AddImageFromSource 合并属性写回，
     /// 这样 Apple MakerNote 才会真正落进文件。
-    private static func makeStill(_ image: CGImage, identifier: String,
-                                  notes: inout [String]) -> (Data, String)? {
+    private static func makeStillData(_ image: CGImage, identifier: String,
+                                      notes: inout [String]) -> Data? {
         // A：两遍法 + AddImageFromSource（主路径）
         if let base = encodeHEIC(image) {
             if let patched = patchMakerApple(base, identifier: identifier, fromSource: true) {
                 if makerIdentifier(patched) == identifier {
                     notes.append("still=A")
-                    return (patched, "still.heic")
+                    return patched
                 }
                 notes.append("A:丢标识")
             } else {
@@ -399,7 +378,7 @@ enum BurnEngine {
             if let patched = patchMakerApple(base, identifier: identifier, fromSource: false) {
                 if makerIdentifier(patched) == identifier {
                     notes.append("still=C")
-                    return (patched, "still.heic")
+                    return patched
                 }
                 notes.append("C:丢标识")
             }
@@ -410,7 +389,7 @@ enum BurnEngine {
         if let direct = encodeHEIC(image, extra: [kCGImagePropertyMakerAppleDictionary: ["17": identifier]]),
            makerIdentifier(direct) == identifier {
             notes.append("still=B")
-            return (direct, "still.heic")
+            return direct
         }
         notes.append("B:丢标识")
         return nil
@@ -480,17 +459,25 @@ enum BurnEngine {
 
     // MARK: - 自检（不依赖相册权限，纯读文件）
 
-    private static func selfCheck(stillData: Data, stillURL: URL,
-                                  videoURL: URL, identifier: String) -> String {
+    static func selfCheck(stillURL: URL, videoURL: URL, identifier: String) -> String {
         var parts: [String] = []
 
         var format = "?"
-        if let src = CGImageSourceCreateWithData(stillData as CFData, nil),
+        var makerOK = "miss"
+        if let src = CGImageSourceCreateWithURL(stillURL as CFURL, nil),
            let type = CGImageSourceGetType(src) {
-            format = String(type)
+            format = String(type).replacingOccurrences(of: "public.", with: "")
+            if let data = try? Data(contentsOf: stillURL) {
+                makerOK = makerIdentifier(data) == identifier ? "ok" : "miss"
+            }
+            if let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+               let w = props[kCGImagePropertyPixelWidth] as? Int,
+               let h = props[kCGImagePropertyPixelHeight] as? Int {
+                parts.append("ssize=\(w)x\(h)")
+            }
         }
-        parts.append("still=\(format.replacingOccurrences(of: "public.", with: ""))")
-        parts.append("img17=\(makerIdentifier(stillData) == identifier ? "ok" : "miss")")
+        parts.append("still=\(format)")
+        parts.append("img17=\(makerOK)")
 
         let asset = AVAsset(url: videoURL)
         var movIdentifier = "miss"
@@ -501,7 +488,6 @@ enum BurnEngine {
         }
         parts.append("movId=\(movIdentifier)")
 
-        // 有独立的 metadata 轨道即视为成功（本例中除 still-image-time 外没有别的元数据轨）
         let stillTime = asset.tracks(withMediaType: .metadata).isEmpty ? "miss" : "ok"
         parts.append("sit=\(stillTime)")
 
@@ -509,16 +495,10 @@ enum BurnEngine {
             let size = track.naturalSize.applying(track.preferredTransform)
             parts.append("vsize=\(Int(abs(size.width)))x\(Int(abs(size.height)))")
         }
-        if let source = CGImageSourceCreateWithURL(stillURL as CFURL, nil),
-           let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-           let w = props[kCGImagePropertyPixelWidth] as? Int,
-           let h = props[kCGImagePropertyPixelHeight] as? Int {
-            parts.append("ssize=\(w)x\(h)")
-        }
         return parts.joined(separator: " ")
     }
 
-    private static func tmpURL(_ name: String) -> URL {
+    static func tmpURL(_ name: String) -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("dtc-\(UUID().uuidString)-\(name)")
     }
