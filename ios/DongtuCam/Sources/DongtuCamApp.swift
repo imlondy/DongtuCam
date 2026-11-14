@@ -66,7 +66,7 @@ struct ContentView: View {
     @State private var recognitionDisabledThisRun = false
 
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
-    private let buildTag = "v18"
+    private let buildTag = "v19"
     /// 预览文字的磅值（和下面 copyPreview 里的 13 保持一致）
     private let previewFontPt: CGFloat = 13
 
@@ -471,6 +471,7 @@ struct ContentView: View {
             let still: StillOutput
             do {
                 still = try await Self.makeStill(frame: frame, overlay: overlay,
+                                                 source: source,
                                                  identifier: identifier)
             } catch {
                 Diagnostics.mark("process.still-failed")
@@ -594,10 +595,11 @@ struct ContentView: View {
     // MARK: - 回调转 async
 
     private static func makeStill(frame: CGImage, overlay: CGImage?,
+                                  source: URL,
                                   identifier: String) async throws -> StillOutput {
         try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<StillOutput, Error>) in
-            BurnEngine.makeStill(frame: frame, overlay: overlay,
+            BurnEngine.makeStill(frame: frame, overlay: overlay, source: source,
                                  identifier: identifier) { result in
                 continuation.resume(with: result)
             }
