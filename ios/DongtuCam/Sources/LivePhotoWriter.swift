@@ -77,6 +77,34 @@ enum LivePhotoWriter {
         }
     }
 
+    // MARK: - 降级：只存照片
+
+    /// 实况配对失败时的兜底：至少把「带字的那张 HEIC」存成普通照片，
+    /// 让用户这一拍不完全白费（界面上会写明实况没配上）。
+    static func saveStill(_ still: URL, completion: @escaping (Result<Void, Error>) -> Void) {
+        authorize(addOnly: true) { allowed in
+            guard allowed else {
+                completion(.failure(LivePhotoWriterError.denied))
+                return
+            }
+            PHPhotoLibrary.shared().performChanges {
+                let creation = PHAssetCreationRequest.forAsset()
+                let options = PHAssetResourceCreationOptions()
+                options.originalFilename = "DTC_TEXT.HEIC"
+                creation.addResource(with: .photo, fileURL: still, options: options)
+            } completionHandler: { success, error in
+                DispatchQueue.main.async {
+                    if success {
+                        completion(.success(()))
+                    } else {
+                        let reason = error?.localizedDescription ?? "未知错误"
+                        completion(.failure(LivePhotoWriterError.failed("存照片失败：\(reason)")))
+                    }
+                }
+            }
+        }
+    }
+
     // MARK: - 依次尝试三种提交方式
 
     private enum Mode: String {
