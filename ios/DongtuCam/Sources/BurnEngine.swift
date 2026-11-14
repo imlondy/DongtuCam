@@ -10,52 +10,6 @@ struct StillOutput {
     let report: String
 }
 
-/// 静帧的几何参数：**必须与配对视频的编码尺寸、方向一致**。
-///
-/// 这是 v19 找到的关键一致性缺陷。相机录制的视频是「编码横向 + 旋转矩阵」，
-/// 而我们之前把首帧用 `appliesPreferredTrackTransform` 转正后直接编码成
-/// 竖向像素（1080x1440，方向标记 = 1）。于是同一对实况里：
-///   照片：编码 1080x1440（竖）+ 无方向标记
-///   视频：编码 1440x1920（横）+ 90° 旋转矩阵
-/// PhotoKit 在 `addResource(.pairedVideo)` 校验这一对时会判定资源不匹配
-/// ——表现就是 mode A 返回失败、接着 mode B 在框架内部断言（signal=5）。
-///
-/// 原生实况照片从来都是「两者编码尺寸相同、靠方向标记/旋转矩阵显示」，
-/// 所以这里改成同样的做法：静帧编码尺寸 = 视频编码尺寸，方向写进 EXIF。
-struct StillGeometry {
-    /// 编码方向 → 显示方向 的旋转
-    enum Rotation: Equatable {
-        case none, cw, ccw
-
-        var opposite: Rotation {
-            switch self {
-            case .none: return .none
-            case .cw: return .ccw
-            case .ccw: return .cw
-            }
-        }
-
-        /// 该旋转对应的 EXIF 方向（1 = 不旋转 / 6 = 顺转 90° / 8 = 逆转 90°）
-        var exif: Int {
-            switch self {
-            case .none: return 1
-            case .cw: return 6
-            case .ccw: return 8
-            }
-        }
-    }
-
-    /// 编码方向 → 显示方向
-    let rotation: Rotation
-    /// 视频轨的编码尺寸（= 静帧应有的编码尺寸）
-    let codedSize: CGSize
-    /// 显示尺寸（= 预览/文字层的画布尺寸）
-    let displaySize: CGSize
-
-    /// 合成好的「显示方向」位图要再做哪个旋转，才能变回编码方向
-    var storeRotation: Rotation { rotation.opposite }
-}
-
 struct VideoOutput {
     let url: URL
     /// 走了哪条路：burn=on / burn=skip(原因) / passthrough
@@ -106,34 +60,59 @@ enum BurnEngine {
 
     // MARK: - 静帧
 
+    /// 静帧画布尺寸：**显示方向的帧再放大 1.5 倍**。
+    ///
+    /// 为什么要放大：静帧是用户唯一能看清的东西，而文字字号是按画布宽度换算的。
+    /// 画布只有视频那么大（1080 宽）时文字约 41px，手机屏宽 1170px，
+    /// 等于把字**放大 8%** 显示 —— 边缘立刻发毛。1.5 倍画布（1620 宽）后，
+    /// 文字按 62px 渲染，缩到屏幕上反而是缩小，边缘干净。
+    /// 原生实况本来就是这样：照片分辨率远高于配对视频。
+    /// 上限 2160 宽，防止大底机型把内存和编码时间顶穿。
+    static func stillCanvasSize(for frame: CGImage) -> CGSize {
+        let w = CGFloat(frame.width)
+        let h = CGFloat(frame.height)
+        guard w > 1, h > 1 else { return CGSize(width: max(w, 2), height: max(h, 2)) }
+        var scale: CGFloat = 1.5
+        if w * scale > 2160 { scale = 2160 / w }
+        if scale < 1 { scale = 1 }
+        return CGSize(width: (w * scale).rounded(), height: (h * scale).rounded())
+    }
+
     /// - Parameters:
     ///   - frame: 已转正的首帧（显示方向）
-    ///   - overlay: 同尺寸透明文字层；为 nil 时输出无字静帧（文案环节失败时的降级）
-    ///   - source: 相机原片，用来读视频轨的编码尺寸与旋转矩阵（对齐实况几何）
+    ///   - overlay: 与 `stillCanvasSize` 同尺寸的透明文字层；nil 时输出无字静帧
+    ///   - source: 相机原片（保留参数以便上层统一调用）
+    ///
+    /// ## v21：彻底不写方向标记
+    ///
+    /// v19/v20 为「与视频编码尺寸一致」，把竖拍画面转回横向像素、再把方向写进
+    /// EXIF。但 HEIC 的方向可以同时用 EXIF 和 `irot` 盒表达，两遍写入很容易被
+    /// 应用两次 —— 真机上看到的就是**倒置的图**（90°+90°=180°）。
+    ///
+    /// 现在改成最不可能出错的做法：**像素就是显示方向，方向标记恒为 1**。
+    /// 照片在相册、抖音、任何看图软件里都不会转错；配对也不受影响
+    /// （配对只认资源标识符，不认尺寸方向）。
     static func makeStill(frame: CGImage, overlay: CGImage?, source: URL,
                           identifier: String,
                           completion: @escaping (Result<StillOutput, Error>) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             var notes: [String] = []
+            let canvas = stillCanvasSize(for: frame)
+            notes.append("cs=\(Int(canvas.width))x\(Int(canvas.height))")
 
             Diagnostics.mark("burn.flatten")
-            let composed = autoreleasepool { flatten(frame: frame, overlay: overlay) }
-            guard let composed else {
+            guard let composed = autoreleasepool(invoking: {
+                flatten(frame: frame, overlay: overlay, canvas: canvas)
+            }) else {
                 DispatchQueue.main.async {
                     completion(.failure(BurnEngineError.composeFailed("画布创建失败")))
                 }
                 return
             }
 
-            // 几何：静帧的编码尺寸与方向必须跟配对视频一致，否则 PhotoKit 判无效资源
-            Diagnostics.mark("burn.geom")
-            let geom = autoreleasepool { geometry(videoURL: source, display: frame) }
-            notes.append("geom=\(Int(geom.codedSize.width))x\(Int(geom.codedSize.height))")
-            notes.append("o=\(geom.rotation.exif)")
-
             Diagnostics.mark("burn.heic")
             guard let made = autoreleasepool(invoking: {
-                encodeOriented(composed, geometry: geom, identifier: identifier, notes: &notes)
+                makeStillData(composed, identifier: identifier, notes: &notes)
             }) else {
                 DispatchQueue.main.async {
                     completion(.failure(BurnEngineError.stillFailed(notes.joined(separator: " / "))))
@@ -156,157 +135,10 @@ enum BurnEngine {
         }
     }
 
-    // MARK: - 几何探测（编码尺寸 / 旋转方向）
-
-    /// 读出视频轨的编码尺寸与「编码→显示」的旋转方向。
-    ///
-    /// 方向不靠猜：取同一时刻的**原始帧**与**转正帧**，各自缩成 16x16 灰度图，
-    /// 把原始帧分别顺/逆转 90° 去比对，误差小的那个就是真实方向。
-    private static func geometry(videoURL: URL, display: CGImage) -> StillGeometry {
-        let displaySize = CGSize(width: display.width, height: display.height)
-        let asset = AVAsset(url: videoURL)
-        guard let track = asset.tracks(withMediaType: .video).first else {
-            return StillGeometry(rotation: .none, codedSize: displaySize, displaySize: displaySize)
-        }
-        let natural = track.naturalSize
-        let coded = CGSize(width: abs(natural.width).rounded(), height: abs(natural.height).rounded())
-
-        guard coded.width != displaySize.width || coded.height != displaySize.height else {
-            return StillGeometry(rotation: .none, codedSize: coded, displaySize: displaySize)
-        }
-
-        var rotation = StillGeometry.Rotation.cw
-        if let raw = previewFrame(from: videoURL, applyTransform: false) {
-            let reference = grayThumb(display)
-            let base = grayThumb(raw)
-            let cwScore = diff(rotateThumb(base, clockwise: true), reference)
-            let ccwScore = diff(rotateThumb(base, clockwise: false), reference)
-            rotation = cwScore <= ccwScore ? .cw : .ccw
-            Diagnostics.mark("burn.geom-\(rotation == .cw ? "cw" : "ccw")")
-        } else {
-            // 拿不到原始帧时按尺寸推断：编码是横的、显示是竖的，就是竖拍
-            rotation = displaySize.height > displaySize.width ? .cw : .none
-        }
-        return StillGeometry(rotation: rotation, codedSize: coded, displaySize: displaySize)
-    }
-
-    /// 16x16 灰度指纹：用来做方向/几何比对，与真实画质无关
-    private static func grayThumb(_ image: CGImage, side: Int = 16) -> [UInt8] {
-        var bytes = [UInt8](repeating: 0, count: side * side)
-        bytes.withUnsafeMutableBytes { raw in
-            guard let ctx = CGContext(data: raw.baseAddress, width: side, height: side,
-                                      bitsPerComponent: 8, bytesPerRow: side,
-                                      space: CGColorSpaceCreateDeviceGray(),
-                                      bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return }
-            ctx.interpolationQuality = .high
-            ctx.draw(image, in: CGRect(x: 0, y: 0, width: side, height: side))
-        }
-        return bytes
-    }
-
-    /// 旋转方形指纹数组（图像坐标，y 向下）
-    private static func rotateThumb(_ src: [UInt8], clockwise: Bool) -> [UInt8] {
-        let side = Int(Double(src.count).squareRoot().rounded())
-        guard side * side == src.count else { return src }
-        var out = [UInt8](repeating: 0, count: src.count)
-        for y in 0..<side {
-            for x in 0..<side {
-                let value = src[y * side + x]
-                if clockwise {
-                    out[x * side + (side - 1 - y)] = value
-                } else {
-                    out[(side - 1 - x) * side + y] = value
-                }
-            }
-        }
-        return out
-    }
-
-    private static func diff(_ a: [UInt8], _ b: [UInt8]) -> Int {
-        guard a.count == b.count, !a.isEmpty else { return 255 }
-        var total = 0
-        for index in 0..<a.count {
-            total += abs(Int(a[index]) - Int(b[index]))
-        }
-        return total / a.count
-    }
-
-    /// 把「显示方向」的合成图转回「编码方向」
-    private static func rotate(_ image: CGImage,
-                               by rotation: StillGeometry.Rotation) -> CGImage? {
-        guard rotation != .none else { return image }
-        let w = image.width
-        let h = image.height
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 1
-        format.opaque = true
-        format.preferredRange = .standard
-        return UIGraphicsImageRenderer(size: CGSize(width: h, height: w),
-                                       format: format).image { ctx in
-            let cg = ctx.cgContext
-            if rotation == .cw {
-                cg.translateBy(x: CGFloat(h), y: 0)
-                cg.rotate(by: .pi / 2)
-            } else {
-                cg.translateBy(x: 0, y: CGFloat(w))
-                cg.rotate(by: -.pi / 2)
-            }
-            // 90° 整数倍旋转不做插值，像素是一一搬过去的
-            cg.draw(image, in: CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
-        }.cgImage
-    }
-
-    /// 按几何编码静帧，并用「解码后按 EXIF 转正的小图」与显示图比对，
-    /// 自动纠正方向（万一对旋转方向判断反了，这里会自己换回来）。
-    private static func encodeOriented(_ display: CGImage, geometry: StillGeometry,
-                                       identifier: String, notes: inout [String]) -> Data? {
-        let reference = grayThumb(display)
-        var best: (data: Data, score: Int, exif: Int)?
-
-        for store in [geometry.storeRotation, geometry.storeRotation.opposite] {
-            guard let coded = rotate(display, by: store) else { continue }
-            // 存的是「编码方向」的像素，显示时需要 store 的反向旋转
-            let exif = store.opposite.exif
-            var local: [String] = []
-            guard let data = makeStillData(coded, orientation: exif,
-                                           identifier: identifier, notes: &local) else {
-                notes.append(contentsOf: local)
-                continue
-            }
-            let score = thumbScore(data, reference: reference)
-            if best == nil || score < best!.score {
-                best = (data, score, exif)
-            }
-            // 误差已经很小（同一画面 + 文字层，正常 0~10），不用再试另一个方向
-            if score <= 12 { break }
-        }
-
-        guard let best else { return nil }
-        notes.append("exif=\(best.exif)")
-        notes.append("oScore=\(best.score)")
-        return best.data
-    }
-
-    /// 把编码好的静帧按 EXIF 转正、缩成 16x16，和「显示图」的指纹算平均差值
-    private static func thumbScore(_ data: Data, reference: [UInt8]) -> Int {
-        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return 255 }
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: 16
-        ]
-        guard let thumb = CGImageSourceCreateThumbnailAtIndex(src, 0, options as CFDictionary) else {
-            return 255
-        }
-        return diff(grayThumb(thumb), reference)
-    }
-
-    /// 把首帧与文字层压成一张不透明位图（两者同尺寸，绝不缩放）
-    private static func flatten(frame: CGImage, overlay: CGImage?) -> CGImage? {
-        let width = frame.width
-        let height = frame.height
-        guard width > 1, height > 1 else { return nil }
-        let size = CGSize(width: width, height: height)
+    /// 把首帧与文字层压成一张不透明位图。
+    /// - 底图按画布尺寸放大一次（文字层已经按画布渲染，1:1 叠上去，不再缩放）
+    private static func flatten(frame: CGImage, overlay: CGImage?, canvas: CGSize) -> CGImage? {
+        guard canvas.width > 1, canvas.height > 1 else { return nil }
 
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
@@ -314,13 +146,13 @@ enum BurnEngine {
         // 固定 sRGB：广色域会让白字发灰、描边发糊
         format.preferredRange = .standard
 
-        let image = UIGraphicsImageRenderer(size: size, format: format).image { ctx in
+        let image = UIGraphicsImageRenderer(size: canvas, format: format).image { ctx in
             UIColor.black.setFill()
-            ctx.fill(CGRect(origin: .zero, size: size))
-            UIImage(cgImage: frame).draw(in: CGRect(origin: .zero, size: size))
-            // draw(_:in:) 在 1:1 的矩形里是像素直拷，不会引入模糊
+            ctx.fill(CGRect(origin: .zero, size: canvas))
+            ctx.interpolationQuality = .high
+            UIImage(cgImage: frame).draw(in: CGRect(origin: .zero, size: canvas))
             if let overlay {
-                UIImage(cgImage: overlay).draw(in: CGRect(origin: .zero, size: size))
+                UIImage(cgImage: overlay).draw(in: CGRect(origin: .zero, size: canvas))
             }
         }
         return image.cgImage
@@ -388,7 +220,8 @@ enum BurnEngine {
                 reader.add(videoOut)
 
                 let writer = try AVAssetWriter(outputURL: outURL, fileType: .mov)
-                writer.metadata = [contentIdentifierItem(identifier)]
+                // 文件级元数据：配对标识符（实况的命根子）+ 创建时间
+                writer.metadata = [contentIdentifierItem(identifier), creationDateItem()]
 
                 let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: nil)
                 videoInput.expectsMediaDataInRealTime = false
@@ -487,6 +320,19 @@ enum BurnEngine {
         return item
     }
 
+    /// 原生实况的配对视频都带拍摄时间；缺了它，个别系统版本会把它当成
+    /// 「来源不明的片段」，进相册后排序也会乱。
+    private static func creationDateItem() -> AVMetadataItem {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        let item = AVMutableMetadataItem()
+        item.key = "com.apple.quicktime.creationdate" as NSString
+        item.keySpace = .quickTimeMetadata
+        item.value = formatter.string(from: Date()) as NSString
+        item.dataType = kCMMetadataBaseDataType_UTF8 as String
+        return item
+    }
+
     /// still-image-time 的写入输入：必须带 SInt8 的 sourceFormatHint，否则运行期崩溃
     private static func stillImageTimeInput() throws -> AVAssetWriterInput {
         let spec: [CFString: Any] = [
@@ -516,13 +362,16 @@ enum BurnEngine {
     /// 从零编码 HEIC 时 ImageIO 会静默丢掉 MakerApple，所以主路径是：
     /// 先编出一份合法 HEIC，再从这份已有的 HEIC 源用 AddImageFromSource 合并属性写回，
     /// 这样 Apple MakerNote 才会真正落进文件。
-    private static func makeStillData(_ image: CGImage, orientation: Int,
-                                      identifier: String,
+    ///
+    /// 两处 v21 的修正：
+    ///   1. **方向标记恒为 1**（像素已经是正的，见 `makeStill` 的说明）；
+    ///   2. **两遍都给满质量**——第二遍不传压缩质量时 ImageIO 按 0.8 重编，
+    ///      白字边缘会被直接糊掉，这就是「文字一直不清晰」的真凶之一。
+    private static func makeStillData(_ image: CGImage, identifier: String,
                                       notes: inout [String]) -> Data? {
         // A：两遍法 + AddImageFromSource（主路径）
-        if let base = encodeHEIC(image, orientation: orientation) {
-            if let patched = patchMakerApple(base, orientation: orientation,
-                                             identifier: identifier, fromSource: true) {
+        if let base = encodeHEIC(image) {
+            if let patched = patchMakerApple(base, identifier: identifier, fromSource: true) {
                 if makerIdentifier(patched) == identifier {
                     notes.append("still=A")
                     return patched
@@ -532,8 +381,7 @@ enum BurnEngine {
                 notes.append("A:回写失败")
             }
             // C：两遍法 + AddImage
-            if let patched = patchMakerApple(base, orientation: orientation,
-                                             identifier: identifier, fromSource: false) {
+            if let patched = patchMakerApple(base, identifier: identifier, fromSource: false) {
                 if makerIdentifier(patched) == identifier {
                     notes.append("still=C")
                     return patched
@@ -544,7 +392,7 @@ enum BurnEngine {
             notes.append("A:HEIC编码失败")
         }
         // B：一遍法，直接把 MakerApple 塞进编码属性
-        if let direct = encodeHEIC(image, orientation: orientation,
+        if let direct = encodeHEIC(image,
                                    extra: [kCGImagePropertyMakerAppleDictionary: ["17": identifier]]),
            makerIdentifier(direct) == identifier {
             notes.append("still=B")
@@ -554,7 +402,8 @@ enum BurnEngine {
         return nil
     }
 
-    private static func encodeHEIC(_ image: CGImage, orientation: Int,
+    /// 编码 HEIC：像素就是最终方向，不写方向标记；质量拉满
+    private static func encodeHEIC(_ image: CGImage,
                                    extra: [CFString: Any] = [:]) -> Data? {
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(data as CFMutableData,
@@ -562,8 +411,7 @@ enum BurnEngine {
             return nil
         }
         var props: [CFString: Any] = [
-            kCGImageDestinationLossyCompressionQuality: 0.98,
-            kCGImagePropertyOrientation: orientation
+            kCGImageDestinationLossyCompressionQuality: 1.0
         ]
         for (key, value) in extra { props[key] = value }
         CGImageDestinationAddImage(dest, image, props as CFDictionary)
@@ -571,12 +419,14 @@ enum BurnEngine {
         return data as Data
     }
 
-    private static func patchMakerApple(_ base: Data, orientation: Int, identifier: String,
+    private static func patchMakerApple(_ base: Data, identifier: String,
                                         fromSource: Bool) -> Data? {
         guard let src = CGImageSourceCreateWithData(base as CFData, nil) else { return nil }
         var props = (CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]) ?? [:]
-        // 方向必须保住：它决定静帧在相册里是竖的还是躺着
-        props[kCGImagePropertyOrientation] = orientation
+        // 方向恒为 1：像素已经转正，任何额外的旋转标记都会把图转歪（v20 的倒图就是它）
+        props[kCGImagePropertyOrientation] = 1
+        // 这一遍是重新编码，不显式给质量就会被默认的 0.8 糊掉
+        props[kCGImageDestinationLossyCompressionQuality] = 1.0
         var maker: [String: Any] = [:]
         if let raw = props[kCGImagePropertyMakerAppleDictionary] as? [String: Any] {
             maker = raw
