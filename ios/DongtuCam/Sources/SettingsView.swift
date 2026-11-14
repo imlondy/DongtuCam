@@ -9,6 +9,8 @@ struct AISettingsView: View {
     @State private var testing = false
     @State private var testResult: String?
     @State private var testOK = false
+    /// 与 VideoBurner/OutputPrefs 共用同一个 key
+    @AppStorage("dtc.burn.into.video") private var burnIntoVideo = true
 
     var body: some View {
         NavigationStack {
@@ -21,6 +23,20 @@ struct AISettingsView: View {
                     Text("开关")
                 } footer: {
                     Text("关闭 AI 时用内置模板（10 条轮换，并会随机避开上一条）。开启后每次拍摄都会按画面重新写一条。")
+                }
+
+                Section {
+                    Toggle("文案也压进动图", isOn: $burnIntoVideo)
+                } header: {
+                    Text("输出")
+                } footer: {
+                    Text("""
+                    开启：动图播放时也能看到文案，文字每一帧贴在同一位置，钉住不晃。
+                    · 照片（封面）永远清晰，用原始首帧 1:1 合成
+                    · 动图里的字要重新编码一次视频，画质有一次性轻微压缩
+                    · 处理时间会多 1~3 秒；压字失败会自动退回「字只印在照片上」，不会让这一拍白费
+                    关闭：只输出原始视频 + 带字照片（最快、最省电）
+                    """)
                 }
 
                 Section {
