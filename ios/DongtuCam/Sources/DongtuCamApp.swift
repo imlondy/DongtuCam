@@ -54,6 +54,9 @@ struct ContentView: View {
     @State private var phase: Phase = .idle
     @State private var permission = false
     @State private var statusText = "选好商品 → 点快门拍 5 秒 → 自动出片"
+    @State private var lastError: String?
+    /// 显示在右上角的构建标识：装错包时一眼就能看出来
+    private let buildTag = "v9"
 
     var body: some View {
         ZStack {
@@ -73,6 +76,18 @@ struct ContentView: View {
                 topBar
                 copyPreview
                 Spacer()
+                if let lastError {
+                    Text(lastError)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.white)
+                        .multilineTextAlignment(.leading)
+                        .textSelection(.enabled)
+                        .padding(9)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 9))
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 6)
+                }
                 statusBar
                 shutter
             }
@@ -126,6 +141,13 @@ struct ContentView: View {
             }
 
             Spacer()
+
+            Text(buildTag)
+                .font(.caption2.weight(.black))
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(Color.yellow, in: Capsule())
+                .foregroundStyle(.black)
         }
         .foregroundStyle(.white)
         .padding(.horizontal, 14)
@@ -208,6 +230,7 @@ struct ContentView: View {
             switch result {
             case .failure(let error):
                 self.phase = .failed(error.localizedDescription)
+                self.lastError = "录制失败\n" + error.localizedDescription
                 self.statusText = "录制失败：\(error.localizedDescription)"
             case .success(let url):
                 self.process(url)
@@ -237,6 +260,7 @@ struct ContentView: View {
             switch burned {
             case .failure(let error):
                 self.phase = .failed(error.localizedDescription)
+                self.lastError = "处理失败\n" + error.localizedDescription
                 self.statusText = "处理失败：\(error.localizedDescription)"
             case .success(let output):
                 LivePhotoWriter.save(still: output.stillURL, video: output.videoURL,
@@ -244,10 +268,12 @@ struct ContentView: View {
                     switch saved {
                     case .success:
                         self.phase = .done
+                        self.lastError = nil
                         self.statusText = "已存入相册 · 抖音「+ → 相册 → 动图」直接发"
                     case .failure(let error):
                         self.phase = .failed(error.localizedDescription)
-                        self.statusText = "写相册失败：\(error.localizedDescription)"
+                        self.lastError = "\(self.buildTag) 写入相册失败\n" + error.localizedDescription
+                        self.statusText = "写入相册失败（详情见下方）"
                     }
                 }
             }
