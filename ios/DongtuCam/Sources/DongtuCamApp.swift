@@ -2,10 +2,14 @@ import SwiftUI
 import AVFoundation
 import UIKit
 
+/// 构建标识：界面右上角显示，同时写进崩溃日志的启动行。
+/// 崩溃现场靠它区分「这次崩的是哪个包」—— 装错包、或看到上一版的旧现场时一眼能认出。
+let appBuildTag = "v24"
+
 @main
 struct DongtuCamApp: App {
     init() {
-        Diagnostics.installCrashHandler()
+        Diagnostics.installCrashHandler(tag: appBuildTag)
     }
 
     var body: some Scene {
@@ -77,7 +81,7 @@ struct ContentView: View {
     @State private var autoDetectedID: String?
 
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
-    private let buildTag = "v24"
+    private let buildTag = appBuildTag
     /// 预览文字的磅值（和下面 copyPreview 里的 13 保持一致）
     private let previewFontPt: CGFloat = 13
 
@@ -152,12 +156,15 @@ struct ContentView: View {
         }
         // 上次是崩着退出的：把现场留在界面上，截图就能定位
         if let incident = Diagnostics.takeLastIncident() {
-            lastError = "\(buildTag) 上次现场\n" + incident
+            // 用「崩的那个包」的版本号标注，而不是当前版本 ——
+            // 否则刚装新版就会显示成「v24 上次现场」，把上一版的旧账算到新版头上
+            let crashTag = incident.tag ?? buildTag
+            lastError = "\(crashTag) 上次现场\n" + incident.text
             // 自愈：连续崩就直接降级到「只出片」，不再碰识别与 AI。
             // 宁可少一个功能，也不能让用户每次拍都闪退。
             let fragile = ["copy.recognize", "process.frame", "process.text",
                            "process.compose", "burn.", "burnV.", "process.save", "camera.record"]
-            if fragile.contains(where: { incident.contains($0) }) {
+            if fragile.contains(where: { incident.text.contains($0) }) {
                 let strikes = UserDefaults.standard.integer(forKey: "dtc.crash.strikes") + 1
                 UserDefaults.standard.set(strikes, forKey: "dtc.crash.strikes")
                 if strikes >= 2 {
