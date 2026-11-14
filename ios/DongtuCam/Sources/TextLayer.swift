@@ -3,13 +3,18 @@ import CoreGraphics
 
 /// 把整段文案渲染成一张与视频同尺寸的透明 CGImage。
 ///
+/// 字号规则（这次按真机反馈改的）：
+/// 成片里的字要和**拍摄时屏幕上预览的那几行字**看起来一样大，只大 2 磅。
+/// 预览是 13pt、铺满屏宽；成片是视频像素铺满同一块屏，所以换算比例是
+/// `视频宽 / 屏宽`。之前直接取「画布宽 7.8%」，在 1440 宽的视频上等于
+/// 112px ≈ 预览的 2.4 倍，成片里的字明显比预览大一整圈。
+///
 /// 视觉规范（抖音动图带货）：
 /// - 整段常驻、居中对齐、上方安全区；无顶部渐变、无背景色块
 /// - 微暖白字 + 细描边（≤2.5% 字号）+ 柔和投影
 ///
 /// 为什么描边必须这么细：中文字粗体笔画宽度约为字号的 8~10%，
 /// 描边一宽就会从两侧吃掉笔画中间的白色，字变成黑色实心块。
-/// 早期版本用了 6.5% 字号描边，屏幕上就是一坨黑色的模糊文字。
 enum TextLayer {
     /// 单次渲染的最大行数（再多会把字号压到看不清）
     private static let maxLines = 5
@@ -18,7 +23,13 @@ enum TextLayer {
     /// 投影模糊半径占字号的比例
     private static let shadowRatio: CGFloat = 0.07
 
-    static func make(lines: [String], size: CGSize) -> CGImage? {
+    /// - Parameters:
+    ///   - size: 成片画布尺寸（视频显示尺寸）
+    ///   - previewFontPt: 拍摄预览里那几行字的字号（pt）
+    ///   - screenWidthPt: 手机屏幕宽度（pt），用来把 pt 换算成视频像素
+    static func make(lines: [String], size: CGSize,
+                     previewFontPt: CGFloat = 13,
+                     screenWidthPt: CGFloat = 393) -> CGImage? {
         let cleaned = lines
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -33,22 +44,28 @@ enum TextLayer {
         format.preferredRange = .standard
 
         return UIGraphicsImageRenderer(size: size, format: format).image { _ in
-            draw(cleaned, size: size)
+            draw(cleaned, size: size,
+                 previewFontPt: previewFontPt, screenWidthPt: screenWidthPt)
         }.cgImage
     }
 
     // MARK: - 排版
 
-    private static func draw(_ lines: [String], size: CGSize) {
+    private static func draw(_ lines: [String], size: CGSize,
+                             previewFontPt: CGFloat, screenWidthPt: CGFloat) {
         let w = size.width
         let h = size.height
 
-        // 字号上限：竖向视频按「画布宽 7.8%」和「画布高 11.5%」取小值，
-        // 再由最长行宽 / 总高度约束向下收敛。
-        let maxWidth = w * 0.88
+        // pt → 成片像素：同一条屏宽上，视频像素数 / 屏幕磅数
+        let pxPerPt = w / max(1, screenWidthPt)
+        // 预览 +2pt，就是用户要的「比预览大 2 个 px」
+        let target = (previewFontPt + 2) * pxPerPt
+
+        let maxWidth = w * 0.90
         let maxBlockHeight = h * 0.42
-        let upperBound = min(w * 0.078, h * 0.115)
-        let lowerBound = max(12, w * 0.030)
+        // 兜底上下限：再小看不清，再大就会盖住商品
+        let upperBound = min(target, w * 0.085)
+        let lowerBound = max(10, w * 0.028)
 
         var fontSize = upperBound
         var lineHeight = fontSize * lineSpacing
@@ -58,7 +75,7 @@ enum TextLayer {
             if widest <= maxWidth && lineHeight * CGFloat(lines.count) <= maxBlockHeight {
                 break
             }
-            fontSize -= max(1, fontSize * 0.02)
+            fontSize -= max(1, fontSize * 0.03)
         }
         fontSize = max(fontSize, lowerBound)
         lineHeight = fontSize * lineSpacing
