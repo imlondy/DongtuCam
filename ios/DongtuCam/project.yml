@@ -20,8 +20,11 @@ targets:
     sources:
       - Sources
       - Resources
-    info:
-      path: Info.plist
+    # 注意：这里必须是「字符串形式」= 直接使用现有 Info.plist 原样打包，
+    # 千万不能写成 info: { path: Info.plist } 这种字典形式——XcodeGen 会把
+    # Info.plist 重新生成为默认模板，丢掉 NSCameraUsageDescription 等隐私权限键，
+    # 导致 App 一调相机就被系统 TCC 直接 SIGABRT 闪退。
+    info: Info.plist
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.dongtu.cam
