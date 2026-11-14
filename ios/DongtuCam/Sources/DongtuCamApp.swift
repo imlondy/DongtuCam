@@ -66,7 +66,7 @@ struct ContentView: View {
     @State private var recognitionDisabledThisRun = false
 
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
-    private let buildTag = "v15"
+    private let buildTag = "v16"
     /// 预览文字的磅值（和下面 copyPreview 里的 13 保持一致）
     private let previewFontPt: CGFloat = 13
 
@@ -113,6 +113,8 @@ struct ContentView: View {
 
     private func onAppear() {
         askPermission()
+        // 后台配置：打开就同步一次（失败无所谓，沿用上一次的值）
+        Task { @MainActor in await aiSettings.syncRemote() }
         // 上次是崩着退出的：把现场留在界面上，截图就能定位
         if let incident = Diagnostics.takeLastIncident() {
             lastError = "\(buildTag) 上次现场\n" + incident
@@ -142,6 +144,17 @@ struct ContentView: View {
             UserDefaults.standard.set(0, forKey: "dtc.crash.strikes")
         }
         Diagnostics.mark("app.ready")
+
+        // 上次没走完（含闪退）的素材：自动补存进相册。
+        // 这是「一次性解决白拍」的最后一道保险——不依赖崩溃处理，
+        // 只依赖「录制后就落盘」这一个近乎不会失败的动作。
+        ShotStore.shared.recover { message in
+            if let message {
+                statusText = message
+                // 补存成功后不要再显示「上次现场」，避免用户以为又崩了
+                if lastError?.contains("上次现场") == true { lastError = nil }
+            }
+        }
     }
 
     // MARK: 顶部：商品 + 文案操作 + 设置
@@ -418,112 +431,200 @@ struct ContentView: View {
         return 393
     }
 
+    // MARK: - 一次快门 = 完整链路（每一级都能失败，失败就降级，绝不白拍）
+
     private func process(_ source: URL) {
         Task { @MainActor in
             phase = .processing
-            statusText = "整理文案…"
             Diagnostics.mark("process.begin")
 
-            // 抽帧放到后台：AVAssetImageGenerator 是同步解码，放主线程会卡 UI，
-            // 手指还在按屏幕时更容易被判「无响应」。
-            // v14 起这一帧是**必经步骤**（它就是静帧的底图），不再只为识别而抽。
+            // 0) 先落盘。从这一刻起这一拍就丢不了了：
+            //    后面任何一步把进程带走，下次冷启动 ShotStore.recover 会自动补存。
+            let shotID = ShotStore.shared.begin(video: source)
+            Diagnostics.mark(shotID == nil ? "process.stage-failed" : "process.staged")
+
+            // 1) 抽帧：既是静帧底图，也是识别输入
+            statusText = "取画面…"
             Diagnostics.mark("process.frame")
             guard let frame = await Self.frameInBackground(source) else {
                 Diagnostics.mark("process.frame-nil")
-                phase = .failed("取不到画面")
-                statusText = "没有取到画面，请重拍一段"
-                lastError = "\(buildTag) 抽帧失败 · \(source.lastPathComponent)"
-                Diagnostics.clear()
+                await decline(toVideo: source, shotID: shotID,
+                              reason: "取不到画面，已把原片存进相册")
                 return
             }
             Diagnostics.mark("process.frame-ok")
 
-            // 识别结果只喂 AI，AI 没配就不跑 Vision（省内存，也是闪退的主要来源之一）
+            // 2) 文案：识别失败/网络失败都不影响出片，本地模板兜底
             await prepareCopy(frame: recognitionNeeded ? frame : nil)
             if copyEngine.lines.isEmpty { copyEngine.regenerate() }
             Diagnostics.mark("process.copy")
 
-            // 字号跟「拍摄时屏幕上看到的预览文字」对齐，只大 2 磅。
-            // 图层尺寸 = 静帧像素尺寸，后面 1:1 叠加，全程不缩放（缩放就是糊的根源）。
+            // 3) 文字层。失败不致命：出无字静帧，仍然能配成实况。
             let renderSize = CGSize(width: frame.width, height: frame.height)
-            let screenWidth = Self.screenWidthPt
+            statusText = "排版文字…"
             Diagnostics.mark("process.text")
-            let lines = copyEngine.lines
-            guard let overlay = await Self.overlayInBackground(lines: lines,
-                                                              size: renderSize,
-                                                              previewFontPt: previewFontPt,
-                                                              screenWidth: screenWidth) else {
-                phase = .failed("文案渲染失败")
-                statusText = "文案渲染失败，请先选商品"
-                lastError = "\(buildTag) 文案渲染失败 · size=\(Int(renderSize.width))x\(Int(renderSize.height))"
-                Diagnostics.clear()
+            let overlay = await Self.overlayInBackground(lines: copyEngine.lines,
+                                                         size: renderSize,
+                                                         previewFontPt: previewFontPt,
+                                                         screenWidth: Self.screenWidthPt)
+            Diagnostics.mark(overlay == nil ? "process.text-nil" : "process.text-ok")
+
+            // 4) 静帧：做完立刻进暂存区，崩溃也有东西可恢复
+            statusText = "生成封面…"
+            Diagnostics.mark("process.still")
+            let identifier = UUID().uuidString
+            let still: StillOutput
+            do {
+                still = try await Self.makeStill(frame: frame, overlay: overlay,
+                                                 identifier: identifier)
+            } catch {
+                Diagnostics.mark("process.still-failed")
+                await decline(toVideo: source, shotID: shotID,
+                              reason: "封面生成失败，已存原片")
                 return
             }
+            Self.persist(still.url, as: "still.heic", id: shotID)
+            ShotStore.shared.mark(shotID, stage: "still")
 
-            let burnVideo = OutputPrefs.burnIntoVideo
-            statusText = burnVideo ? "合成文字（照片 + 动图）→ 写入相册…" : "合成文字 → 写入相册…"
-            Diagnostics.mark("process.compose")
+            // 5) 视频。压字失败只会退化成原始画面，不影响出片。
+            statusText = OutputPrefs.burnIntoVideo ? "处理动图（逐帧压字）…" : "封装视频…"
+            Diagnostics.mark("process.video")
+            var video: VideoOutput?
             do {
-                let output = try await Self.compose(source: source, frame: frame,
-                                                    overlay: overlay, burnIntoVideo: burnVideo)
-                Diagnostics.mark("process.save")
-                statusText = "写入相册…"
+                video = try await Self.makeVideo(source: source, overlay: overlay,
+                                                 renderSize: renderSize,
+                                                 identifier: identifier,
+                                                 burnIntoVideo: OutputPrefs.burnIntoVideo)
+            } catch {
+                Diagnostics.mark("process.video-failed")
+                video = nil
+            }
+            if let video {
+                Self.persist(video.url, as: "video.mov", id: shotID)
+                ShotStore.shared.mark(shotID, stage: "video")
+            }
+
+            // 6) 写相册：实况 → 照片 + 视频，逐级降级
+            statusText = "写入相册…"
+            Diagnostics.mark("process.save")
+            let report = BurnEngine.selfCheck(stillURL: still.url,
+                                              videoURL: video?.url ?? source,
+                                              identifier: identifier)
+                + " vid=" + (video?.mode ?? "none")
+
+            if let video {
                 do {
-                    try await Self.saveLivePhoto(output)
+                    try await Self.saveLivePhoto(still: still.url, video: video.url, report: report)
+                    ShotStore.shared.finish(shotID)
                     phase = .done
                     lastError = nil
                     statusText = "已存入相册 · 抖音「+ → 相册 → 动图」直接发"
                     Diagnostics.clear()
+                    return
                 } catch {
-                    // 实况配对失败也别让这一拍白费：至少把带字的那张照片存下来
-                    let reason = error.localizedDescription
                     Diagnostics.mark("process.live-failed")
-                    var downgraded = false
-                    do {
-                        try await Self.saveStillOnly(output.stillURL)
-                        downgraded = true
-                    } catch {
-                        downgraded = false
-                    }
-                    if downgraded {
-                        phase = .done
-                        statusText = "已存一张带字照片（实况没配上）"
-                        lastError = "\(buildTag) 实况配对未成功，已降级存照片\n\(reason)\n\(output.report)"
-                    } else {
-                        phase = .failed(reason)
-                        statusText = "写相册失败（详情见下方）"
-                        lastError = "\(buildTag) 写相册失败\n\(reason)\n\(output.report)"
-                    }
-                    Diagnostics.clear()
+                    await degrade(still: still.url, video: video.url, shotID: shotID,
+                                  reason: error.localizedDescription, report: report)
+                    return
                 }
-            } catch {
-                phase = .failed(error.localizedDescription)
-                lastError = "\(buildTag) 失败\n" + error.localizedDescription
-                statusText = "处理失败（详情见下方）"
-                Diagnostics.clear()
             }
+            // 视频段完全失败：至少把带字照片 + 原片分别存下来
+            await degrade(still: still.url, video: source, shotID: shotID,
+                          reason: "视频封装失败", report: report)
         }
     }
 
-    // MARK: - 回调转 async（避免嵌套闭包写出花来）
+    /// 连封面都做不出来时的兜底：把原片存成普通视频
+    @MainActor
+    private func decline(toVideo source: URL, shotID: String?, reason: String) async {
+        var saved = false
+        var failure: String?
+        do {
+            try await Self.saveVideoOnly(source)
+            saved = true
+        } catch {
+            failure = error.localizedDescription
+        }
+        if saved {
+            ShotStore.shared.finish(shotID)
+            phase = .done
+            statusText = "已把原片存进相册 · \(reason)"
+            lastError = "\(buildTag) \(reason)"
+        } else {
+            phase = .failed(reason)
+            statusText = "写相册失败（详情见下方）"
+            lastError = "\(buildTag) \(reason)\n\(failure ?? "")"
+        }
+        Diagnostics.clear()
+    }
 
-    private static func compose(source: URL, frame: CGImage, overlay: CGImage,
-                                burnIntoVideo: Bool) async throws -> BurnOutput {
+    /// 实况配对失败的降级：照片 + 视频分别存，两个都失败才算失败
+    @MainActor
+    private func degrade(still: URL, video: URL?, shotID: String?,
+                         reason: String, report: String) async {
+        var saved: [String] = []
+        do {
+            try await Self.saveStillOnly(still)
+            saved.append("带字照片")
+        } catch {
+            Diagnostics.mark("process.still-save-failed")
+        }
+        if let video {
+            do {
+                try await Self.saveVideoOnly(video)
+                saved.append("视频")
+            } catch {
+                Diagnostics.mark("process.video-save-failed")
+            }
+        }
+        if saved.isEmpty {
+            phase = .failed(reason)
+            statusText = "写相册失败（详情见下方）"
+            lastError = "\(buildTag) 写相册失败\n\(reason)\n\(report)"
+        } else {
+            phase = .done
+            ShotStore.shared.finish(shotID)
+            statusText = "已存\(saved.joined(separator: " + "))（实况没配上）"
+            lastError = "\(buildTag) 实况配对未成功，已分存\n\(reason)\n\(report)"
+        }
+        Diagnostics.clear()
+    }
+
+    private static func persist(_ url: URL, as name: String, id: String?) {
+        guard let id else { return }
+        _ = ShotStore.shared.keep(url, as: name, id: id)
+    }
+
+    // MARK: - 回调转 async
+
+    private static func makeStill(frame: CGImage, overlay: CGImage?,
+                                  identifier: String) async throws -> StillOutput {
         try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<BurnOutput, Error>) in
-            BurnEngine.compose(source: source, frame: frame, overlay: overlay,
-                               burnIntoVideo: burnIntoVideo) { result in
+            (continuation: CheckedContinuation<StillOutput, Error>) in
+            BurnEngine.makeStill(frame: frame, overlay: overlay,
+                                 identifier: identifier) { result in
                 continuation.resume(with: result)
             }
         }
     }
 
-    private static func saveLivePhoto(_ output: BurnOutput) async throws {
+    private static func makeVideo(source: URL, overlay: CGImage?, renderSize: CGSize,
+                                  identifier: String,
+                                  burnIntoVideo: Bool) async throws -> VideoOutput {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<VideoOutput, Error>) in
+            BurnEngine.makeVideo(source: source, overlay: overlay, renderSize: renderSize,
+                                 identifier: identifier,
+                                 burnIntoVideo: burnIntoVideo) { result in
+                continuation.resume(with: result)
+            }
+        }
+    }
+
+    private static func saveLivePhoto(still: URL, video: URL, report: String) async throws {
         try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<Void, Error>) in
-            LivePhotoWriter.save(still: output.stillURL,
-                                 video: output.videoURL,
-                                 report: output.report) { result in
+            LivePhotoWriter.save(still: still, video: video, report: report) { result in
                 continuation.resume(with: result)
             }
         }
@@ -533,6 +634,15 @@ struct ContentView: View {
         try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<Void, Error>) in
             LivePhotoWriter.saveStill(still) { result in
+                continuation.resume(with: result)
+            }
+        }
+    }
+
+    private static func saveVideoOnly(_ video: URL) async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            LivePhotoWriter.saveVideo(video) { result in
                 continuation.resume(with: result)
             }
         }
