@@ -1,14 +1,27 @@
 import AVFoundation
+import CoreGraphics
+import CoreImage
 import Foundation
 
 /// 打开即相机：固定录 5 秒短视频。
 /// 用「录视频」而不是系统 Live Photo 拍摄，是因为原生实况只有约 3 秒且不可控；
 /// 5 秒视频 + 抽帧 still 再交给 PhotoKit 写回，时长、文案、版式全部可控。
-final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordingDelegate {
+///
+/// 同时挂了一路视频数据输出，只为了在按下快门那一刻抓一帧给识别用；
+/// 平时自动丢帧，不参与录制，不影响成片。
+final class CameraEngine: NSObject, ObservableObject,
+                          AVCaptureFileOutputRecordingDelegate,
+                          AVCaptureVideoDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
     private let movieOutput = AVCaptureMovieFileOutput()
+    private let videoOutput = AVCaptureVideoDataOutput()
     private let sessionQueue = DispatchQueue(label: "dtc.camera.session")
     private var onFinish: ((Result<URL, Error>) -> Void)?
+
+    private let snapshotLock = NSLock()
+    private var snapshotContinuation: CheckedContinuation<CGImage?, Never>?
+    private var wantsSnapshot = false
+    private static let ciContext = CIContext()
 
     @Published private(set) var isRecording = false
 
@@ -37,6 +50,12 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
         }
         if session.canAddOutput(movieOutput) {
             session.addOutput(movieOutput)
+        }
+        // 抓帧用：不指定 videoSettings，走相机原生格式，避免录制时额外转码
+        videoOutput.alwaysDiscardsLateVideoFrames = true
+        if session.canAddOutput(videoOutput) {
+            session.addOutput(videoOutput)
+            videoOutput.setSampleBufferDelegate(self, queue: sessionQueue)
         }
         // 不强制设置 videoOrientation：由 AVAsset 的 preferredTransform
         // 在导出阶段自动转正，避免 deprecated API 与横竖屏错乱。
@@ -96,6 +115,56 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
             self.movieOutput.stopRecording()
         }
     }
+
+    // MARK: - 抓一帧（给商品识别用）
+
+    /// 取下一帧画面，最长等 1.2 秒；拿不到返回 nil（调用方自行兜底）
+    func snapshot() async -> CGImage? {
+        await withCheckedContinuation { continuation in
+            snapshotLock.lock()
+            if snapshotContinuation != nil {
+                snapshotLock.unlock()
+                continuation.resume(returning: nil)
+                return
+            }
+            snapshotContinuation = continuation
+            wantsSnapshot = true
+            snapshotLock.unlock()
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                self?.finishSnapshot(nil)
+            }
+        }
+    }
+
+    private func finishSnapshot(_ image: CGImage?) {
+        snapshotLock.lock()
+        let continuation = snapshotContinuation
+        snapshotContinuation = nil
+        wantsSnapshot = false
+        snapshotLock.unlock()
+        continuation?.resume(returning: image)
+    }
+
+    func captureOutput(_ output: AVCaptureOutput,
+                       didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        snapshotLock.lock()
+        let waiting = wantsSnapshot
+        snapshotLock.unlock()
+        guard waiting else { return }
+
+        guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let ciImage = CIImage(cvPixelBuffer: buffer)
+        guard let cgImage = Self.ciContext.createCGImage(ciImage, from: ciImage.extent) else {
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.finishSnapshot(cgImage)
+        }
+    }
+
+    // MARK: - 录制回调
 
     func fileOutput(_ output: AVCaptureFileOutput,
                     didFinishRecordingTo outputFileURL: URL,
