@@ -143,8 +143,10 @@ enum VideoBurner {
             let writer = try AVAssetWriter(outputURL: outURL, fileType: .mov)
 
             let fps = max(24.0, min(60.0, Double(videoTrack.nominalFrameRate)))
-            // 码率按像素给：1080x1920 ≈ 8.3Mbps，够抖音二次压缩前的余量
-            let bitrate = Double(width * height) * 4.0
+            // 码率按像素给，系数 6：1080x1920 ≈ 12.4Mbps。
+            // 系数取 4（8.3Mbps）时文字边缘就能看出块状；字是高频细节，
+            // 压缩最伤的就是它，所以宁可多占几 MB 也要把边缘保住。
+            let bitrate = Double(width * height) * 6.0
             let settings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
                 AVVideoWidthKey: width,
