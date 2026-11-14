@@ -67,6 +67,30 @@ enum Diagnostics {
         }
     }
 
+    /// 面包屑顺带记一笔内存占用（MB）。
+    ///
+    /// iOS 对前台 App 的内存有硬上限，超了就是 SIGKILL —— 装不上任何处理器，
+    /// 现场只会「突然停在某一行」。v19 那次日志尾部没有 "!!" 就是这种情况，
+    /// 但光看行号分不清是「内存被杀」还是「用户自己退出」。
+    /// 带上内存曲线之后，一眼就能看出是不是在峰值被带走的。
+    static func markMem(_ step: String) {
+        mark("\(step) mem=\(Int(footprintMB))")
+    }
+
+    /// 当前进程实际占用（phys_footprint），取不到返回 0
+    static var footprintMB: Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size
+                                           / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        return Double(info.phys_footprint) / 1024.0 / 1024.0
+    }
+
     /// 链路正常收尾（成功或已把错误显示给用户）时清空，
     /// 这样「文件里还有内容」就等于「上次没跑完」。
     static func clear() {
@@ -84,21 +108,25 @@ enum Diagnostics {
         if fd < 0 { fd = open(stepPath, O_WRONLY | O_CREAT | O_APPEND, 0o644) }
     }
 
-    /// 读最后 40 行。
+    /// 读最后 60 行。
     ///
     /// 曾经只读 14 行，结果关键一轮的现场被「启动+恢复」的 9 条面包屑顶出了窗口，
-    /// 崩溃点两侧全空白，白白多排查一轮。改 40 行后，一次完整的
-    /// 「启动 → 恢复 → 拍摄 → 处理」都在窗口内。
+    /// 崩溃点两侧全空白，白白多排查一轮。改 40 行后能覆盖一次完整的
+    /// 「启动 → 恢复 → 拍摄 → 处理」，v20 起每步带了内存读数，再放宽到 60。
     private static func readTail() -> String? {
         guard let text = try? String(contentsOfFile: stepPath, encoding: .utf8) else { return nil }
         let lines = text.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
         guard !lines.isEmpty else { return nil }
-        var tail = Array(lines.suffix(40))
-        // 文件里没有 "!!" 说明进程不是被信号/异常带走的，而是被系统直接杀掉
-        // （jetsam 内存回收 / 看门狗）。这两种死法装不上处理器，只能靠推断。
-        if !tail.contains(where: { $0.contains("!!") }) {
-            tail.append("（无异常记录：进程被系统强制结束，多为内存不足）")
+        var tail = Array(lines.suffix(60))
+        // 有 "!!" 才是真崩（信号 / ObjC 异常）。
+        if tail.contains(where: { $0.contains("!!") }) {
+            return tail.joined(separator: "\n")
         }
+        // 尾部是「切后台/退出」标记：说明上次是正常结束，不是闪退。
+        // 以前这种情况也会弹「上次现场」，反而盖住了真正的崩溃 —— 直接忽略。
+        if tail.contains(where: { $0.contains("app.background") }) { return nil }
+        // 没有异常、也没正常退出：进程是被系统直接杀掉的（jetsam 内存 / 看门狗）。
+        tail.append("（无异常记录：进程被系统结束，多为内存不足 —— 看 mem= 是否很高）")
         return tail.joined(separator: "\n")
     }
 
