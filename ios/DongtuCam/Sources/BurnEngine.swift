@@ -112,7 +112,7 @@ enum BurnEngine {
             // passthrough：不重新编码
             let videoInput = AVAssetWriterInput(mediaType: .video,
                                                 outputSettings: nil,
-                                                sourceFormatHint: track.formatDescriptions.first)
+                                                sourceFormatHint: track.formatDescriptions.first as? CMFormatDescription)
             videoInput.expectsMediaDataInRealTime = false
 
             let metadataInput = try makeStillImageTimeInput()
