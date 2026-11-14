@@ -66,7 +66,7 @@ struct ContentView: View {
     @State private var recognitionDisabledThisRun = false
 
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
-    private let buildTag = "v17"
+    private let buildTag = "v18"
     /// 预览文字的磅值（和下面 copyPreview 里的 13 保持一致）
     private let previewFontPt: CGFloat = 13
 
@@ -458,10 +458,10 @@ struct ContentView: View {
             let renderSize = CGSize(width: frame.width, height: frame.height)
             statusText = "排版文字…"
             Diagnostics.mark("process.text")
-            let overlay = await Self.overlayInBackground(lines: copyEngine.lines,
-                                                         size: renderSize,
-                                                         previewFontPt: previewFontPt,
-                                                         screenWidth: Self.screenWidthPt)
+            var overlay: CGImage? = await Self.overlayInBackground(lines: copyEngine.lines,
+                                                                   size: renderSize,
+                                                                   previewFontPt: previewFontPt,
+                                                                   screenWidth: Self.screenWidthPt)
             Diagnostics.mark(overlay == nil ? "process.text-nil" : "process.text-ok")
 
             // 4) 静帧：做完立刻进暂存区，崩溃也有东西可恢复
@@ -480,6 +480,9 @@ struct ContentView: View {
             }
             Self.persist(still.url, as: "still.heic", id: shotID)
             ShotStore.shared.mark(shotID, stage: "still")
+
+            // 文字层此刻已无用，立刻放掉，给后面的视频段腾内存
+            overlay = nil
 
             // 5) 视频：相机原片无损重封装 + 配对元数据，不解码、不重编码。
             //    这是全链路里被 v10~v14 真机验证过最稳的一段，也是唯一能出「动图」的路。
