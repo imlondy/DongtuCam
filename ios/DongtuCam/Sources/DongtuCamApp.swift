@@ -56,7 +56,7 @@ struct ContentView: View {
     @State private var statusText = "选好商品 → 点快门拍 5 秒 → 自动出片"
     @State private var lastError: String?
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
-    private let buildTag = "v9"
+    private let buildTag = "v10"
 
     var body: some View {
         ZStack {
