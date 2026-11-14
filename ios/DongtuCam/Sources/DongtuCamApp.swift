@@ -66,8 +66,18 @@ struct ContentView: View {
     /// 上一次崩在识别/抽帧这一步时，本次先跳过识别，保证能出片
     @State private var recognitionDisabledThisRun = false
 
+    /// 最近一次成功出片：左下角缩略图 + 点开能播的实况预览
+    @State private var lastShot: ShotResult?
+    @State private var showShotPreview = false
+    /// 画面调节面板是否展开
+    @State private var showAdjust = false
+    /// 自动识别：正在处理一帧时挡住后续帧（相机 2.5 秒一帧，重叠处理会白耗 CPU）
+    @State private var scanning = false
+    /// 已经为哪个商品生成过文案，避免同一款反复请求 AI
+    @State private var autoDetectedID: String?
+
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
-    private let buildTag = "v22"
+    private let buildTag = "v23"
     /// 预览文字的磅值（和下面 copyPreview 里的 13 保持一致）
     private let previewFontPt: CGFloat = 13
 
@@ -101,12 +111,21 @@ struct ContentView: View {
                         .padding(.horizontal, 14)
                         .padding(.bottom, 6)
                 }
+                if showAdjust {
+                    adjustPanel
+                        .padding(.bottom, 10)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
                 statusBar
-                shutter
+                controls
             }
         }
         .onAppear(perform: onAppear)
-        .onDisappear(perform: camera.stop)
+        .onDisappear {
+            // 摘掉取帧回调：App 退到后台时相机那边就彻底不转图了
+            camera.onFrame = nil
+            camera.stop()
+        }
         // 正常切后台/退出留个记号：下次冷启动就不会把「用户自己关掉」
         // 误判成「闪退」（v19 现场面板就是这么误报的）
         .onChange(of: scenePhase) { phase in
@@ -115,12 +134,22 @@ struct ContentView: View {
         .sheet(isPresented: $showSettings) {
             AISettingsView(settings: aiSettings, copyEngine: copyEngine)
         }
+        .sheet(isPresented: $showShotPreview) {
+            if let lastShot {
+                LivePhotoPreviewSheet(shot: lastShot)
+            }
+        }
+        .onChange(of: aiSettings.autoDetectOnCamera) { _ in wireAutoDetect() }
     }
 
     private func onAppear() {
         askPermission()
         // 后台配置：打开就同步一次（失败无所谓，沿用上一次的值）
-        Task { @MainActor in await aiSettings.syncRemote() }
+        Task { @MainActor in
+            await aiSettings.syncRemote()
+            // 等配置到位再开自动识别：否则会拿着旧 Key 白跑一轮
+            wireAutoDetect()
+        }
         // 上次是崩着退出的：把现场留在界面上，截图就能定位
         if let incident = Diagnostics.takeLastIncident() {
             lastError = "\(buildTag) 上次现场\n" + incident
@@ -287,7 +316,102 @@ struct ContentView: View {
             }
         }
         .disabled(working || !permission)
-        .padding(.bottom, 30)
+    }
+
+    // MARK: 底部控件：缩略图 / 快门 / 调节
+
+    private var controls: some View {
+        HStack(spacing: 0) {
+            // 左：刚拍的那张。没有就先留白，保证快门永远在正中间
+            Group {
+                if let shot = lastShot {
+                    ShotThumbnail(shot: shot) { showShotPreview = true }
+                        .transition(.scale(scale: 0.6).combined(with: .opacity))
+                } else {
+                    Color.clear
+                }
+            }
+            .frame(width: 78, height: 62, alignment: .leading)
+
+            Spacer(minLength: 0)
+            shutter
+            Spacer(minLength: 0)
+
+            // 右：画面调节
+            Button {
+                withAnimation(.easeOut(duration: 0.24)) { showAdjust.toggle() }
+            } label: {
+                Image(systemName: "slider.horizontal.3")
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundStyle(showAdjust ? Color.black : Color.white)
+                    .frame(width: 44, height: 44)
+                    .background(showAdjust ? Color.yellow : Color.white.opacity(0.18), in: Circle())
+            }
+            .frame(width: 78, alignment: .trailing)
+        }
+        .padding(.horizontal, 20)
+        .padding(.bottom, 26)
+    }
+
+    // MARK: 画面调节面板
+
+    private var adjustPanel: some View {
+        VStack(spacing: 11) {
+            HStack {
+                Text("画面调节")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.68))
+                Spacer()
+                Button {
+                    camera.resetAdjustments()
+                } label: {
+                    Text("重置")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 4)
+                        .background(.white.opacity(0.18), in: Capsule())
+                }
+            }
+
+            adjustRow("亮度",
+                      value: Binding(get: { Double(camera.exposureBias) },
+                                     set: { camera.setExposureBias(Float($0)) }),
+                      range: Double(camera.exposureRange.lowerBound)...Double(camera.exposureRange.upperBound),
+                      readout: String(format: "%+.1f", camera.exposureBias))
+
+            adjustRow("变焦",
+                      value: Binding(get: { Double(camera.zoomFactor) },
+                                     set: { camera.setZoom(CGFloat($0)) }),
+                      range: 1...Double(max(2, camera.maxZoom)),
+                      readout: String(format: "%.1f×", camera.zoomFactor))
+
+            adjustRow("色温",
+                      value: Binding(get: { Double(camera.kelvin) },
+                                     set: { camera.setKelvin(CGFloat($0)) }),
+                      range: 3000...8000,
+                      readout: camera.autoWhiteBalance ? "自动" : "\(Int(camera.kelvin))K")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .padding(.horizontal, 16)
+    }
+
+    private func adjustRow(_ title: String, value: Binding<Double>,
+                           range: ClosedRange<Double>, readout: String) -> some View {
+        HStack(spacing: 10) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.78))
+                .frame(width: 30, alignment: .leading)
+            Slider(value: value, in: range)
+                .tint(.yellow)
+            Text(readout)
+                .font(.system(size: 10.5, weight: .bold).monospacedDigit())
+                .foregroundStyle(.white.opacity(0.92))
+                .frame(width: 50, alignment: .trailing)
+        }
     }
 
     private var working: Bool {
@@ -396,6 +520,73 @@ struct ContentView: View {
                                             imageJPEG: jpeg)
         if let note = copyEngine.note { statusText = note }
         Diagnostics.mark("copy.ai-done")
+    }
+
+    // MARK: 举着商品就认（自动识别 → 自动切商品 → 自动出文案）
+
+    /// 把相机的取帧回调接上识别流程。
+    /// 关掉开关、或本次处于「跳过识别」的自愈模式时直接把回调摘掉 ——
+    /// 相机那边就彻底不再转图，等于零开销。
+    @MainActor
+    private func wireAutoDetect() {
+        guard aiSettings.autoDetectOnCamera, !recognitionDisabledThisRun, permission else {
+            camera.onFrame = nil
+            Diagnostics.mark("auto.off")
+            return
+        }
+        Diagnostics.mark("auto.on")
+        camera.onFrame = { image in
+            Task { @MainActor in await self.scan(image) }
+        }
+    }
+
+    /// 收到一帧（相机每 2.5 秒送一次）：本地识别 → 命中就切商品 → 有 AI 就写文案。
+    ///
+    /// 三道闸：正在出片、正在录、上一帧还没处理完 —— 任一成立就直接丢弃这一帧。
+    /// 识别本身是纯本机 Vision，不花钱；**AI 只在商品真的换了才调一次**。
+    @MainActor
+    private func scan(_ image: CGImage) async {
+        guard !scanning, !working, permission else { return }
+        guard aiSettings.autoDetectOnCamera, !recognitionDisabledThisRun else { return }
+        scanning = true
+        defer { scanning = false }
+
+        Diagnostics.mark("auto.scan")
+        let recognition = await ProductRecognizer.analyze(frame: image,
+                                                          products: copyEngine.products)
+        guard let hit = recognition.localHit else {
+            Diagnostics.mark("auto.miss")
+            return
+        }
+        // 同一款不重复处理：省 AI 额度，也避免预览文字一直跳
+        guard hit.id != autoDetectedID else { return }
+        autoDetectedID = hit.id
+        Diagnostics.mark("auto.hit")
+
+        // 先切商品：select 会立刻换成本地模板文案，保证任何时候都有字可看
+        copyEngine.select(hit)
+        lastRecognition = recognition
+
+        guard aiSettings.isReady else {
+            statusText = "识别到「\(hit.name)」· 已用本地文案"
+            return
+        }
+        statusText = "识别到「\(hit.name)」· AI 写文案…"
+        _ = await copyEngine.generateWithAI(config: aiSettings.config,
+                                            recognition: recognition,
+                                            imageJPEG: nil)
+        if let note = copyEngine.note { statusText = note }
+    }
+
+    /// 出片成功：把封面挂到左下角。
+    /// 缩略图取自本地 still.heic，不依赖相册权限；`identifier` 用来点开时回读实况。
+    @MainActor
+    private func publishShot(still: URL, identifier: String?, isLive: Bool?) {
+        let thumb = ShotThumbnailMaker.image(from: still)
+        Diagnostics.mark(thumb == nil ? "shot.thumb-nil" : "shot.thumb-ok")
+        withAnimation(.easeOut(duration: 0.26)) {
+            lastShot = ShotResult(thumbnail: thumb, localIdentifier: identifier, isLive: isLive)
+        }
     }
 
     // MARK: 烧字 + 写相册
@@ -531,6 +722,10 @@ struct ContentView: View {
                     ShotStore.shared.finish(shotID)
                     phase = .done
                     lastError = nil
+                    // 左下角挂上这一拍的缩略图（点开能播实况 + 跳相册）
+                    publishShot(still: still.url,
+                                identifier: outcome.localIdentifier,
+                                isLive: outcome.verifiedLive)
                     // 拿到完整相册权限时会回读确认；确认不了就不把话说满
                     statusText = outcome.verifiedLive == true
                         ? "已存入相册 · 系统已确认是实况 · 抖音「+ → 相册 → 动图」直接发"
@@ -600,6 +795,8 @@ struct ContentView: View {
         } else {
             phase = .done
             ShotStore.shared.finish(shotID)
+            // 实况没配上也算出片：缩略图照样挂上，只是没有相册标识
+            publishShot(still: still, identifier: nil, isLive: false)
             statusText = "已存\(saved.joined(separator: " + "))（实况没配上）"
             lastError = "\(buildTag) 实况配对未成功，已分存\n\(reason)\n\(report)"
         }
