@@ -32,14 +32,8 @@ enum Diagnostics {
     }
 
     static func installCrashHandler() {
-        NSSetUncaughtExceptionHandler { exception in
-            let name = exception.name.rawValue
-            let reason = exception.reason ?? "(无原因)"
-            let stack = exception.callStackSymbols.prefix(6).joined(separator: "\n")
-            let text = "\(name)：\(reason)\n\(stack)"
-            UserDefaults.standard.set(text, forKey: crashKey)
-            UserDefaults.standard.synchronize()
-        }
+        // 必须传「不捕获上下文」的全局函数，闭包里引用类型成员编译器会拒绝
+        NSSetUncaughtExceptionHandler(dtcHandleException)
     }
 
     /// 启动时取上次遗留的现场；取完即清，避免重复提示
@@ -55,4 +49,19 @@ enum Diagnostics {
         }
         return parts.isEmpty ? nil : parts.joined(separator: "\n")
     }
+
+    /// 供全局函数写入用
+    fileprivate static func record(Exception exception: NSException) {
+        let name = exception.name.rawValue
+        let reason = exception.reason ?? "(无原因)"
+        let stack = exception.callStackSymbols.prefix(6).joined(separator: "\n")
+        let text = "\(name)：\(reason)\n\(stack)"
+        UserDefaults.standard.set(text, forKey: crashKey)
+        UserDefaults.standard.synchronize()
+    }
+}
+
+/// ObjC 异常处理器：必须是全局函数（C 函数指针），不能是捕获上下文的闭包
+private func dtcHandleException(_ exception: NSException) {
+    Diagnostics.record(Exception: exception)
 }
