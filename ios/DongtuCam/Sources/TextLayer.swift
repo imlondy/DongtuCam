@@ -68,9 +68,9 @@ enum TextLayer {
 
         let maxWidth = w * 0.90
         let maxBlockHeight = h * 0.42
-        // 兜底上下限：再小看不清，再大就会盖住商品
+        // 兜底上下限：再小看不清（v18 抬高了下限），再大就会盖住商品
         let upperBound = min(target, w * 0.085)
-        let lowerBound = max(10, w * 0.028)
+        let lowerBound = max(14, w * 0.034)
 
         var fontSize = upperBound
         var lineHeight = fontSize * lineSpacing
