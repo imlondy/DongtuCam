@@ -356,9 +356,10 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
         guard let device = videoDevice else { return }
         let clamped = max(device.minExposureTargetBias,
                           min(device.maxExposureTargetBias, value))
-        guard withDeviceConfig("exposure") { dev in
+        let applied = withDeviceConfig("exposure") { dev in
             dev.setExposureTargetBias(clamped)
-        } else { return }
+        }
+        guard applied else { return }
         publish { if self.exposureBias != clamped { self.exposureBias = clamped } }
     }
 
@@ -383,9 +384,10 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
         guard let device = videoDevice else { return }
         let ceiling = max(1, min(device.maxAvailableVideoZoomFactor, 6))
         let clamped = max(1, min(ceiling, value))
-        guard withDeviceConfig("zoom") { dev in
+        let applied = withDeviceConfig("zoom") { dev in
             dev.videoZoomFactor = clamped
-        } else { return }
+        }
+        guard applied else { return }
         publish { if self.zoomFactor != clamped { self.zoomFactor = clamped } }
     }
 
@@ -416,7 +418,7 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
             Diagnostics.mark("camera.wb-unsupported")
             return
         }
-        guard withDeviceConfig("wb") { dev in
+        let applied = withDeviceConfig("wb") { dev in
             let target = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
                 temperature: Float(value), tint: 0)
             let gains = dev.deviceWhiteBalanceGains(for: target)
@@ -426,7 +428,8 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
                 with: AVCaptureDevice.WhiteBalanceGains(redGain: safe(gains.redGain),
                                                         greenGain: safe(gains.greenGain),
                                                         blueGain: safe(gains.blueGain)))
-        } else { return }
+        }
+        guard applied else { return }
         publish {
             if self.kelvin != value { self.kelvin = value }
             self.autoWhiteBalance = false
@@ -444,9 +447,10 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
         sessionQueue.async { [weak self] in
             guard let self, let device = self.videoDevice else { return }
             guard device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) else { return }
-            guard self.withDeviceConfig("wb-reset") { dev in
+            let applied = self.withDeviceConfig("wb-reset") { dev in
                 dev.whiteBalanceMode = .continuousAutoWhiteBalance
-            } else { return }
+            }
+            guard applied else { return }
             Diagnostics.mark("camera.wb-reset-ok")
         }
     }
