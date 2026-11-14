@@ -21,10 +21,24 @@ struct AIConfig: Codable, Equatable {
 
 final class AISettings: ObservableObject {
     private static let storageKey = "dtc.ai.config.v1"
+    private static let remoteKey = "dtc.ai.remote"
+    private static let lastSyncKey = "dtc.ai.lastSync"
 
     @Published var config: AIConfig = AIConfig() {
         didSet { persist() }
     }
+
+    /// 后台配置地址。这是唯一还留在 App 里的「参数」——它只决定去**哪里**拿参数，
+    /// Base URL / Key / 模型 / 识别开关全部由后台下发（见 RemoteConfig）。
+    @Published var remoteURL: String = UserDefaults.standard.string(forKey: AISettings.remoteKey) ?? "" {
+        didSet { UserDefaults.standard.set(remoteURL, forKey: Self.remoteKey) }
+    }
+    @Published private(set) var lastSync: Date? =
+        UserDefaults.standard.object(forKey: AISettings.lastSyncKey) as? Date
+    @Published private(set) var syncMessage: String = ""
+    @Published private(set) var syncing = false
+    /// 后台附带的运营提示（如「本周主推陶瓷碗」）
+    @Published private(set) var remoteNote: String?
 
     init() {
         if let data = UserDefaults.standard.data(forKey: Self.storageKey),
@@ -41,6 +55,52 @@ final class AISettings: ObservableObject {
     /// 有开关 + 有 Key 才算可用
     var isReady: Bool {
         config.enabled && !config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    // MARK: - 后台同步
+
+    /// 拉一次后台配置。失败不影响任何功能：沿用上一次成功同步的值（或本地模板）。
+    @MainActor
+    func syncRemote() async {
+        let address = remoteURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !address.isEmpty else {
+            syncMessage = "还没填后台地址，当前用上一次的配置"
+            return
+        }
+        guard !syncing else { return }
+        syncing = true
+        defer { syncing = false }
+        do {
+            let remote = try await RemoteConfig.fetch(address: address)
+            apply(remote)
+            let now = Date()
+            lastSync = now
+            UserDefaults.standard.set(now, forKey: Self.lastSyncKey)
+            remoteNote = remote.note
+            syncMessage = "已同步 · \(config.enabled ? "AI 开启" : "AI 关闭") · \(config.model)"
+            Diagnostics.mark("remote.sync-ok")
+        } catch {
+            syncMessage = "同步失败：\(error.localizedDescription)"
+            Diagnostics.mark("remote.sync-failed")
+        }
+    }
+
+    /// 后台字段都是可选的：只覆盖它明确给了的项。
+    @MainActor
+    func apply(_ remote: RemoteAIConfig) {
+        var next = config
+        if let value = remote.enabled { next.enabled = value }
+        if let value = remote.baseURL, !value.isEmpty { next.baseURL = value }
+        if let value = remote.apiKey, !value.isEmpty { next.apiKey = value }
+        if let value = remote.model, !value.isEmpty { next.model = value }
+        if let value = remote.temperature { next.temperature = value }
+        if let value = remote.autoRecognize { next.autoRecognize = value }
+        if let value = remote.useVision { next.useVision = value }
+        if let value = remote.autoGenerateOnShoot { next.autoGenerateOnShoot = value }
+        config = next
+        if let burn = remote.burnIntoVideo {
+            OutputPrefs.burnIntoVideo = burn
+        }
     }
 }
 
