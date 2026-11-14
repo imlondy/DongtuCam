@@ -30,10 +30,13 @@ enum TextLayer {
     /// 单次渲染的最大行数（再多会把字号压到看不清）
     private static let maxLines = 5
     /// 外描边宽度（百分比，相对字号）。正值 strokeWidth 的语义是「只描边、不填充」，
-    /// 线宽 = 字号 × strokePercent / 100，居中画在字形轮廓上。
-    /// 6% 在 62px 字号下约 3.7px，第二遍填充后会留下约 1.9px 的外轮廓 ——
-    /// 这正是短视频字幕那种「利落黑边」的粗细。
-    private static let strokePercent: CGFloat = 6.0
+    /// 线宽 = 字号 × strokePercent / 100，**居中**画在字形轮廓上；
+    /// 第二遍填充会把内侧那一半完全盖掉，所以最终可见的只是外侧 `strokePercent/2`。
+    /// 9% 在 62px 字号下 → 外轮廓约 2.8px，是短视频字幕那种「利落黑边」的粗细，
+    /// 字与背景任何颜色下都能分开，又不至于把白字挤细。
+    /// 关键安全点：描边只出现在**字形外部**，笔画内部的白色永远是完整的 ——
+    /// 这正是 v14~v21「负 strokeWidth 居中吃掉笔画」做不到的。
+    private static let strokePercent: CGFloat = 9.0
     private static let lineSpacing: CGFloat = 1.26
 
     // MARK: - 排版结果
