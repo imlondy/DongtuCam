@@ -28,11 +28,15 @@ struct Recognition {
     }
 }
 
-/// 纯本机识别：Vision 做文字识别 + 图像分类，再用商品库的关键词打分。
-/// 不联网、不花钱，识别结果同时作为 AI 的输入。
+/// 纯本机识别：Vision 做文字识别，识别不到再补一次图像分类，
+/// 然后用商品库的关键词打分。
+///
+/// 这一版把开销压到最低，原因是「闪退」的最常见真凶就是这里的峰值内存：
+/// - 只做**一次** OCR：传入的帧已经过 preferredTransform 转正，不需要两个朝向各跑一遍；
+/// - 只有 OCR 一个字都没读到，才去跑图像分类（分类模型本身也要占几十 MB）；
+/// - 输入长边缩到 1024（OCR 足够，内存约为 1280 的 0.64 倍）；
+/// - 整段包在 autoreleasepool 里，跑完立刻还内存。
 enum ProductRecognizer {
-    /// Vision 与图像缩放都放后台线程，且整段包在 autoreleasepool 里，
-    /// 避免 4K 图反复识别时内存越堆越高（前台被系统杀掉就是「闪退」）。
     static func analyze(frame: CGImage, products: [Product]) async -> Recognition {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -47,18 +51,13 @@ enum ProductRecognizer {
 
     private static func analyzeSync(frame: CGImage, products: [Product]) -> Recognition {
         var result = Recognition()
-        // 识别不需要原图那么大：长边 1280 足够 OCR 与分类，速度和内存都稳得多
-        let small = downscale(frame, maxSide: 1280)
+        let small = downscale(frame, maxSide: 1024)
 
-        // 相机缓冲区是传感器朝向（横向），生成图有时是竖向，
-        // 两种都试一遍、取文字更多的那个，避免识别率被朝向拖死。
-        var best: [String] = []
-        for orientation in [CGImagePropertyOrientation.right, .up] {
-            let lines = ocr(small, orientation: orientation)
-            if lines.joined().count > best.joined().count { best = lines }
+        result.ocrLines = ocr(small)
+        // 画面里没字（比如一罐没有正面标签的东西）才退一步用图像分类
+        if result.ocrLines.isEmpty {
+            result.labels = classify(small)
         }
-        result.ocrLines = best
-        result.labels = classify(small)
 
         let match = localMatch(result, products: products)
         result.localHit = match.product
@@ -106,19 +105,21 @@ enum ProductRecognizer {
     /// 系统抛的是 ObjC 异常（Swift 的 try 接不住），会直接闪退，所以必须先查支持列表。
     private static let textLanguages: [String] = {
         let wanted = ["zh-Hans", "zh-Hant", "en-US"]
-        let supported = (try? VNRecognizeTextRequest.supportedRecognitionLanguages(
-            for: .accurate, revision: VNRecognizeTextRequestRevision3)) ?? []
+        let probe = VNRecognizeTextRequest()
+        probe.recognitionLevel = .accurate
+        let supported = (try? probe.supportedRecognitionLanguages()) ?? []
         guard !supported.isEmpty else { return wanted }
         return wanted.filter { supported.contains($0) }
     }()
 
-    private static func ocr(_ image: CGImage, orientation: CGImagePropertyOrientation) -> [String] {
+    private static func ocr(_ image: CGImage) -> [String] {
         func run(_ languages: [String]) -> [String]? {
             let request = VNRecognizeTextRequest()
             request.recognitionLevel = .accurate
             request.usesLanguageCorrection = true
             if !languages.isEmpty { request.recognitionLanguages = languages }
-            let handler = VNImageRequestHandler(cgImage: image, orientation: orientation, options: [:])
+            // 传入的帧已经转正（previewFrame 用了 preferredTrackTransform），用 .up 即可
+            let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
             do {
                 try handler.perform([request])
             } catch {
@@ -136,7 +137,7 @@ enum ProductRecognizer {
 
     private static func classify(_ image: CGImage) -> [String] {
         let request = VNClassifyImageRequest()
-        let handler = VNImageRequestHandler(cgImage: image, orientation: .right, options: [:])
+        let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
         do {
             try handler.perform([request])
         } catch {
