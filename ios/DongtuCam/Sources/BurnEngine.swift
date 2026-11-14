@@ -149,7 +149,7 @@ enum BurnEngine {
         let image = UIGraphicsImageRenderer(size: canvas, format: format).image { ctx in
             UIColor.black.setFill()
             ctx.fill(CGRect(origin: .zero, size: canvas))
-            ctx.interpolationQuality = .high
+            ctx.cgContext.interpolationQuality = .high
             UIImage(cgImage: frame).draw(in: CGRect(origin: .zero, size: canvas))
             if let overlay {
                 UIImage(cgImage: overlay).draw(in: CGRect(origin: .zero, size: canvas))
