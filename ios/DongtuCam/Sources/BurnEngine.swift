@@ -142,7 +142,7 @@ enum BurnEngine {
             }
 
             let url = tmpURL("still.heic")
-            guard (try? made.write(to: url)) != nil {
+            guard (try? made.write(to: url)) != nil else {
                 DispatchQueue.main.async {
                     completion(.failure(BurnEngineError.stillFailed("静帧落盘失败")))
                 }
