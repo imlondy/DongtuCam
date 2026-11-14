@@ -77,7 +77,7 @@ struct ContentView: View {
     @State private var autoDetectedID: String?
 
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
-    private let buildTag = "v23"
+    private let buildTag = "v24"
     /// 预览文字的磅值（和下面 copyPreview 里的 13 保持一致）
     private let previewFontPt: CGFloat = 13
 
