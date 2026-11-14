@@ -45,8 +45,26 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
     /// 录制中不送帧：识别没必要时时跑，也别和录制抢 CPU
     private var samplingEnabled = true
 
-    /// 送帧回调（主线程）
-    var onFrame: ((CGImage) -> Void)?
+    /// 送帧回调（主线程调用）。
+    ///
+    /// **必须加锁**：Swift 的闭包是「函数指针 + 上下文指针」两个字，
+    /// 主线程赋值、取帧队列读取如果不加锁，就有概率读到撕裂的值 ——
+    /// 崩起来是「偶发、位置随机」，正是本项目最难查的那类崩溃。
+    private let frameLock = NSLock()
+    private var frameHandler: ((CGImage) -> Void)?
+
+    var onFrame: ((CGImage) -> Void)? {
+        get {
+            frameLock.lock()
+            defer { frameLock.unlock() }
+            return frameHandler
+        }
+        set {
+            frameLock.lock()
+            defer { frameLock.unlock() }
+            frameHandler = newValue
+        }
+    }
     /// 采样间隔：2.5 秒一帧足够"举起商品就认出来"，又不会把 CPU 和 AI 额度烧穿
     var sampleInterval: CFTimeInterval = 2.5
 
@@ -406,8 +424,9 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         //  2. 正在录制 → 返回
         //  3. 距上一帧不到 sampleInterval → 返回
         guard output === frameOutput,
-              samplingEnabled,
-              onFrame != nil else { return }
+              samplingEnabled else { return }
+        // 闭包只读一次（锁内），后面用这个局部变量，避免读到撕裂值
+        guard let handler = onFrame else { return }
         let now = CACurrentMediaTime()
         guard now - lastSampleAt >= sampleInterval else { return }
         lastSampleAt = now
@@ -417,8 +436,8 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
         var image: CGImage?
         VTCreateCGImageFromCVPixelBuffer(pixelBuffer, options: nil, imageOut: &image)
         guard let image else { return }
-        DispatchQueue.main.async { [weak self] in
-            self?.onFrame?(image)
+        DispatchQueue.main.async {
+            handler(image)
         }
     }
 }
