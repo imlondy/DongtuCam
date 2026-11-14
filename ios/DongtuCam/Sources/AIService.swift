@@ -40,6 +40,16 @@ final class AISettings: ObservableObject {
     /// 后台附带的运营提示（如「本周主推陶瓷碗」）
     @Published private(set) var remoteNote: String?
 
+    /// 打开相机就自动识别商品并匹配文案。
+    ///
+    /// 特意**不放进 `AIConfig`**：那个结构是从 UserDefaults 整体解码的，
+    /// 加字段会让老版本存下的数据解码失败，用户的 Key 直接丢光。
+    /// 单独一个键零风险。
+    @Published var autoDetectOnCamera: Bool =
+        (UserDefaults.standard.object(forKey: "dtc.ai.autoDetect") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(autoDetectOnCamera, forKey: "dtc.ai.autoDetect") }
+    }
+
     init() {
         if let data = UserDefaults.standard.data(forKey: Self.storageKey),
            let saved = try? JSONDecoder().decode(AIConfig.self, from: data) {
