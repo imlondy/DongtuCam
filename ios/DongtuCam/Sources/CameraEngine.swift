@@ -1,6 +1,8 @@
 import AVFoundation
 import CoreGraphics
 import CoreMedia
+import CoreVideo
+import VideoToolbox
 import Foundation
 
 enum CameraError: LocalizedError {
@@ -34,7 +36,34 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
     private var onFinish: ((Result<URL, Error>) -> Void)?
     private var configured = false
 
+    /// 保留设备引用，美化调节与变焦都要用它
+    private var videoDevice: AVCaptureDevice?
+    /// 供「自动识别商品」用的低开销取帧通道
+    private let frameOutput = AVCaptureVideoDataOutput()
+    private let frameQueue = DispatchQueue(label: "dtc.camera.frames")
+    private var lastSampleAt: CFTimeInterval = 0
+    /// 录制中不送帧：识别没必要时时跑，也别和录制抢 CPU
+    private var samplingEnabled = true
+
+    /// 送帧回调（主线程）
+    var onFrame: ((CGImage) -> Void)?
+    /// 采样间隔：2.5 秒一帧足够"举起商品就认出来"，又不会把 CPU 和 AI 额度烧穿
+    var sampleInterval: CFTimeInterval = 2.5
+
     @Published private(set) var isRecording = false
+
+    // MARK: 美化参数（全部是相机原生能力，预览实时可见、录制时直接固化进成片）
+
+    /// 曝光补偿，单位 EV
+    @Published private(set) var exposureBias: Float = 0
+    @Published private(set) var exposureRange: ClosedRange<Float> = -2...2
+    /// 变焦倍数
+    @Published private(set) var zoomFactor: CGFloat = 1
+    @Published private(set) var maxZoom: CGFloat = 4
+    /// 色温（K），3500 冷 ← 5000 标准 → 7500 暖
+    @Published private(set) var kelvin: CGFloat = 5000
+    /// 是否还在自动白平衡
+    @Published private(set) var autoWhiteBalance = true
 
     func start() {
         sessionQueue.async { [weak self] in
@@ -74,6 +103,14 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
             return false
         }
         Self.selectThreeFourFormat(on: device)
+        videoDevice = device
+        // 曝光补偿的可调范围跟着设备走（iPhone 一般 ±2 EV，个别格式 ±8）
+        let low = max(-2, device.minExposureTargetBias)
+        let high = min(2, device.maxExposureTargetBias)
+        if low < high {
+            DispatchQueue.main.async { self.exposureRange = low...high }
+        }
+        DispatchQueue.main.async { self.maxZoom = min(device.maxAvailableVideoZoomFactor, 6) }
         guard let input = try? AVCaptureDeviceInput(device: device),
               session.canAddInput(input) else {
             session.commitConfiguration()
@@ -90,6 +127,33 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
         if session.canAddOutput(movieOutput) {
             session.addOutput(movieOutput)
         }
+
+        // 取帧通道：给「举起商品 → 自动识别 → 自动匹配文案」用。
+        //
+        // v11 曾因为「4K 会话上再挂一路 data output + 每帧转 CGImage」把内存顶穿而闪退。
+        // 这一版的区别：格式已限制在 1600 以下、**节流到 2.5 秒一帧**、
+        // 只在需要识别时才把帧送出去（onFrame 为 nil 时立刻 return），
+        // 所以它每秒的实际工作量约等于一次缩略图解码。
+        frameOutput.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        ]
+        frameOutput.alwaysDiscardsLateVideoFrames = true
+        frameOutput.setSampleBufferDelegate(self, queue: frameQueue)
+        if session.canAddOutput(frameOutput) {
+            session.addOutput(frameOutput)
+            // 竖的正立帧：Vision 的文字识别对旋转 90° 的画面基本失效
+            if let connection = frameOutput.connection(with: .video) {
+                if #available(iOS 17.0, *) {
+                    connection.videoRotationAngle = 90
+                } else if connection.isVideoOrientationSupported {
+                    connection.videoOrientation = .portrait
+                }
+            }
+            Diagnostics.mark("camera.frame-output-ok")
+        } else {
+            Diagnostics.mark("camera.frame-output-skip")
+        }
+
         session.commitConfiguration()
         configured = true
         Diagnostics.mark("camera.configured")
@@ -171,6 +235,103 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
         }
     }
 
+    // MARK: - 美化调节
+    //
+    // 三项都走相机原生能力，而不是拍完再后期修图。好处是：
+    //   1. 预览里**实时**能看到效果，所见即所得；
+    //   2. 照片（静帧）和视频（动图）拿到的是同一份已经调好的画面，
+    //      不会出现「封面和动图颜色不一致」这种穿帮；
+    //   3. 零额外内存、零额外编码，不给已经很脆的保存链路添风险。
+
+    /// 亮度 = 曝光补偿（EV）。范围跟设备走，一般是 ±2。
+    func setExposureBias(_ value: Float) {
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.videoDevice else { return }
+            let clamped = max(device.minExposureTargetBias,
+                              min(device.maxExposureTargetBias, value))
+            device.setExposureTargetBias(clamped)
+            DispatchQueue.main.async { self.exposureBias = clamped }
+        }
+    }
+
+    /// 变焦。上限取设备能力与 6 倍的较小值（再高就只是糊的数码放大）。
+    func setZoom(_ value: CGFloat) {
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.videoDevice else { return }
+            let ceiling = min(device.maxAvailableVideoZoomFactor, 6)
+            let clamped = max(1, min(ceiling, value))
+            do {
+                try device.lockForConfiguration()
+                device.videoZoomFactor = clamped
+                device.unlockForConfiguration()
+                DispatchQueue.main.async { self.zoomFactor = clamped }
+            } catch {
+                Diagnostics.mark("camera.zoom-failed")
+            }
+        }
+    }
+
+    /// 色温 = 锁定白平衡。数值越小越冷（偏蓝），越大越暖（偏黄）。
+    func setKelvin(_ value: CGFloat) {
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.videoDevice else { return }
+            guard device.isWhiteBalanceModeSupported(.locked) else { return }
+            let clamped = max(3000, min(8000, value))
+            do {
+                try device.lockForConfiguration()
+                let target = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
+                    temperature: Float(clamped), tint: 0)
+                let gains = device.deviceWhiteBalanceGains(for: target)
+                let ceiling = device.maxWhiteBalanceGain
+                func safe(_ v: Float) -> Float { max(1, min(ceiling, v)) }
+                device.setWhiteBalanceModeLocked(
+                    with: AVCaptureDevice.WhiteBalanceGains(redGain: safe(gains.redGain),
+                                                            greenGain: safe(gains.greenGain),
+                                                            blueGain: safe(gains.blueGain)))
+                device.unlockForConfiguration()
+                DispatchQueue.main.async {
+                    self.kelvin = clamped
+                    self.autoWhiteBalance = false
+                }
+            } catch {
+                Diagnostics.mark("camera.wb-failed")
+            }
+        }
+    }
+
+    /// 交还给系统的自动白平衡（换了光线环境后一键找回正常色彩）
+    func resetWhiteBalance() {
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.videoDevice else { return }
+            guard device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) else { return }
+            do {
+                try device.lockForConfiguration()
+                device.whiteBalanceMode = .continuousAutoWhiteBalance
+                device.unlockForConfiguration()
+                DispatchQueue.main.async {
+                    self.autoWhiteBalance = true
+                    self.kelvin = 5000
+                }
+            } catch {
+                Diagnostics.mark("camera.wb-reset-failed")
+            }
+        }
+    }
+
+    /// 一键还原（亮度 0 / 变焦 1x / 自动白平衡）
+    func resetAdjustments() {
+        setExposureBias(0)
+        setZoom(1)
+        resetWhiteBalance()
+    }
+
+    // MARK: - 取帧（自动识别商品）
+
+    /// 打开/关闭送帧。录制期间关掉，避免和录制抢 CPU。
+    func setSamplingEnabled(_ enabled: Bool) {
+        samplingEnabled = enabled
+    }
+
     // MARK: - 录制
 
     func capture(seconds: Double, completion: @escaping (Result<URL, Error>) -> Void) {
@@ -196,6 +357,8 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
             let url = FileManager.default.temporaryDirectory
                 .appendingPathComponent("dtc-cam-\(UUID().uuidString).mov")
             self.onFinish = completion
+            // 录制期间停掉识别取帧：两边同时吃 CPU 只会让录制更容易掉帧
+            self.samplingEnabled = false
             DispatchQueue.main.async { self.isRecording = true }
             self.movieOutput.startRecording(to: url, recordingDelegate: self)
 
@@ -214,6 +377,7 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
                     from connections: [AVCaptureConnection],
                     error: Error?) {
         Diagnostics.mark("camera.recorded")
+        samplingEnabled = true
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.isRecording = false
@@ -225,6 +389,36 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
             }
             self.onFinish?(result)
             self.onFinish = nil
+        }
+    }
+}
+
+// MARK: - 实时取帧（自动识别商品）
+
+/// 单独一个 extension：取帧和录制是两套互不相干的委托，
+/// 混在一个类型里最容易在后续改动中互相误伤。
+extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
+    func captureOutput(_ output: AVCaptureOutput,
+                       didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        // 三重闸门，全在送帧之前挡掉，保证这个回调平时几乎不花时间：
+        //  1. 没人在等帧（没开自动识别）→ 立刻返回
+        //  2. 正在录制 → 返回
+        //  3. 距上一帧不到 sampleInterval → 返回
+        guard output === frameOutput,
+              samplingEnabled,
+              onFrame != nil else { return }
+        let now = CACurrentMediaTime()
+        guard now - lastSampleAt >= sampleInterval else { return }
+        lastSampleAt = now
+
+        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        // VideoToolbox 的零拷贝取图：直接拿到 CGImage，不建 CIImage、不进 GPU
+        var image: CGImage?
+        VTCreateCGImageFromCVPixelBuffer(pixelBuffer, options: nil, imageOut: &image)
+        guard let image else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.onFrame?(image)
         }
     }
 }
