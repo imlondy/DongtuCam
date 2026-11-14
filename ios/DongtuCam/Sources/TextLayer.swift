@@ -1,27 +1,32 @@
 import UIKit
 import CoreGraphics
 
-/// 把整段文案渲染成一张与视频同尺寸的透明 CGImage。
+/// 把整段文案渲染成一张与静帧同像素尺寸的透明 CGImage。
 ///
-/// 字号规则（这次按真机反馈改的）：
+/// 清晰度的前提（v14 最重要的一条）：**这张图层永远按 1:1 叠到同尺寸底图上**，
+/// 中间不允许任何缩放。之前把图层叠到视频里（还要 CIImage 缩放 + 视频编码 +
+/// 再抽帧），每一环都在丢细节，字必糊；现在由 BurnEngine 直接合成静帧，
+/// 图层和底图同为 1080x1440 这种像素尺寸，文字边缘就是干净的抗锯齿。
+///
+/// 字号规则（按真机反馈定的）：
 /// 成片里的字要和**拍摄时屏幕上预览的那几行字**看起来一样大，只大 2 磅。
 /// 预览是 13pt、铺满屏宽；成片是视频像素铺满同一块屏，所以换算比例是
-/// `视频宽 / 屏宽`。之前直接取「画布宽 7.8%」，在 1440 宽的视频上等于
-/// 112px ≈ 预览的 2.4 倍，成片里的字明显比预览大一整圈。
+/// `视频宽 / 屏宽`。
 ///
 /// 视觉规范（抖音动图带货）：
 /// - 整段常驻、居中对齐、上方安全区；无顶部渐变、无背景色块
-/// - 微暖白字 + 细描边（≤2.5% 字号）+ 柔和投影
+/// - 微暖白字 + 细描边（≈2.5% 字号）+ 柔和投影
 ///
 /// 为什么描边必须这么细：中文字粗体笔画宽度约为字号的 8~10%，
 /// 描边一宽就会从两侧吃掉笔画中间的白色，字变成黑色实心块。
+/// 同理字重取 bold 而不是 heavy：小字号下 heavy 的笔画会互相粘成一坨。
 enum TextLayer {
     /// 单次渲染的最大行数（再多会把字号压到看不清）
     private static let maxLines = 5
     /// 描边宽度占字号的比例
-    private static let strokeRatio: CGFloat = 0.024
+    private static let strokeRatio: CGFloat = 0.026
     /// 投影模糊半径占字号的比例
-    private static let shadowRatio: CGFloat = 0.07
+    private static let shadowRatio: CGFloat = 0.075
 
     /// - Parameters:
     ///   - size: 成片画布尺寸（视频显示尺寸）
@@ -77,8 +82,8 @@ enum TextLayer {
             }
             fontSize -= max(1, fontSize * 0.03)
         }
-        fontSize = max(fontSize, lowerBound)
-        lineHeight = fontSize * lineSpacing
+        fontSize = max(fontSize, lowerBound).rounded()
+        lineHeight = (fontSize * lineSpacing).rounded()
 
         let top = max(8, h * 0.055)
         let blockHeight = lineHeight * CGFloat(lines.count)
@@ -88,9 +93,10 @@ enum TextLayer {
         for (index, line) in lines.enumerated() {
             let text = attributed(line, fontSize: fontSize)
             let textSize = text.size()
-            let x = (w - textSize.width) / 2
+            // 坐标取整：落在半个像素上会让 CoreGraphics 做重采样，白字边缘就毛了
+            let x = ((w - textSize.width) / 2).rounded()
             let slotY = startY + CGFloat(index) * lineHeight
-            let y = slotY + max(0, (lineHeight - textSize.height) / 2)
+            let y = (slotY + max(0, (lineHeight - textSize.height) / 2)).rounded()
             text.draw(at: CGPoint(x: x, y: y))
         }
     }
@@ -108,7 +114,7 @@ enum TextLayer {
         let amber = UIColor(red: 1.0, green: 0.784, blue: 0.310, alpha: 1.0)
         let outline = UIColor(red: 0.106, green: 0.063, blue: 0.055, alpha: 0.95)
 
-        let font = UIFont.systemFont(ofSize: fontSize, weight: .heavy)
+        let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
 
         let shadow = NSShadow()
         shadow.shadowColor = UIColor(white: 0, alpha: 0.55)
