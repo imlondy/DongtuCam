@@ -67,7 +67,7 @@ struct ContentView: View {
     @State private var recognitionDisabledThisRun = false
 
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
-    private let buildTag = "v21"
+    private let buildTag = "v22"
     /// 预览文字的磅值（和下面 copyPreview 里的 13 保持一致）
     private let previewFontPt: CGFloat = 13
 
@@ -127,7 +127,7 @@ struct ContentView: View {
             // 自愈：连续崩就直接降级到「只出片」，不再碰识别与 AI。
             // 宁可少一个功能，也不能让用户每次拍都闪退。
             let fragile = ["copy.recognize", "process.frame", "process.text",
-                           "process.compose", "burn.", "process.save", "camera.record"]
+                           "process.compose", "burn.", "burnV.", "process.save", "camera.record"]
             if fragile.contains(where: { incident.contains($0) }) {
                 let strikes = UserDefaults.standard.integer(forKey: "dtc.crash.strikes") + 1
                 UserDefaults.standard.set(strikes, forKey: "dtc.crash.strikes")
@@ -496,13 +496,16 @@ struct ContentView: View {
             // 文字层此刻已无用，立刻放掉，给后面的视频段腾内存
             overlay = nil
 
-            // 5) 视频：相机原片无损重封装 + 配对元数据，不解码、不重编码。
-            //    这是全链路里被 v10~v14 真机验证过最稳的一段，也是唯一能出「动图」的路。
-            statusText = "封装视频…"
+            // 5) 视频：逐帧压字 + 转正（动图播放时也能看到文案），
+            //    压字失败自动降级为无损封装（只是画面里没字）。
+            statusText = "压制动图…"
             Diagnostics.mark("process.video")
             var video: VideoOutput?
             do {
-                video = try await Self.makeVideo(source: source, identifier: identifier)
+                video = try await Self.makeVideo(source: source,
+                                                 lines: copyEngine.lines,
+                                                 screenWidth: Self.screenWidthPt,
+                                                 identifier: identifier)
             } catch {
                 Diagnostics.mark("process.video-failed")
                 video = nil
@@ -622,11 +625,15 @@ struct ContentView: View {
         }
     }
 
-    private static func makeVideo(source: URL,
+    private static func makeVideo(source: URL, lines: [String], screenWidth: CGFloat,
                                   identifier: String) async throws -> VideoOutput {
         try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<VideoOutput, Error>) in
-            BurnEngine.makeVideo(source: source, identifier: identifier) { result in
+            BurnEngine.makeVideo(source: source,
+                                 lines: lines,
+                                 previewFontPt: 13,
+                                 screenWidthPt: screenWidth,
+                                 identifier: identifier) { result in
                 continuation.resume(with: result)
             }
         }
