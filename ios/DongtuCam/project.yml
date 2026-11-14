@@ -27,8 +27,8 @@ targets:
       path: Info.plist
       properties:
         CFBundleDisplayName: 动图相机
-        CFBundleShortVersionString: "23.0"
-        CFBundleVersion: "23"
+        CFBundleShortVersionString: "24.0"
+        CFBundleVersion: "24"
         NSCameraUsageDescription: 拍摄商品实况动图
         NSMicrophoneUsageDescription: 录制动图时同步录音（可在设置里关闭）
         NSPhotoLibraryAddUsageDescription: 把生成好的实况动图直接保存到相册
