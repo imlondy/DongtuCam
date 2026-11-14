@@ -50,13 +50,20 @@ enum Phase {
 struct ContentView: View {
     @StateObject private var camera = CameraEngine()
     @StateObject private var copyEngine = CopyEngine()
+    @StateObject private var aiSettings = AISettings()
 
     @State private var phase: Phase = .idle
     @State private var permission = false
     @State private var statusText = "选好商品 → 点快门拍 5 秒 → 自动出片"
     @State private var lastError: String?
+    @State private var showSettings = false
+
+    /// 录制期间并行跑的「识别 + 写文案」任务
+    @State private var copyJob: Task<Void, Never>?
+    @State private var lastRecognition: Recognition?
+
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
-    private let buildTag = "v10"
+    private let buildTag = "v11"
 
     var body: some View {
         ZStack {
@@ -94,12 +101,15 @@ struct ContentView: View {
         }
         .onAppear(perform: askPermission)
         .onDisappear(perform: camera.stop)
+        .sheet(isPresented: $showSettings) {
+            AISettingsView(settings: aiSettings, copyEngine: copyEngine)
+        }
     }
 
-    // MARK: 顶部：自动匹配商品 + 文案控制
+    // MARK: 顶部：商品 + 文案操作 + 设置
 
     private var topBar: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 7) {
             Menu {
                 ForEach(copyEngine.products) { product in
                     Button(product.name) { copyEngine.select(product) }
@@ -108,7 +118,7 @@ struct ContentView: View {
                 Label(copyEngine.selected?.name ?? "选商品", systemImage: "shippingbox")
                     .font(.subheadline.weight(.semibold))
                     .lineLimit(1)
-                    .padding(.horizontal, 12)
+                    .padding(.horizontal, 11)
                     .padding(.vertical, 8)
                     .background(.ultraThinMaterial, in: Capsule())
             }
@@ -118,29 +128,21 @@ struct ContentView: View {
                     _ = copyEngine.match(text)
                 }
             } label: {
-                Image(systemName: "doc.on.clipboard")
-                    .font(.subheadline.weight(.semibold))
-                    .padding(9)
-                    .background(.ultraThinMaterial, in: Circle())
-            }
-
-            Button(action: copyEngine.regenerate) {
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .font(.subheadline.weight(.semibold))
-                    .padding(9)
-                    .background(.ultraThinMaterial, in: Circle())
+                icon("doc.on.clipboard")
             }
 
             Button {
-                Task { await copyEngine.regenerateFromServer() }
+                Task { await copyEngine.refresh(config: aiSettings.config,
+                                                recognition: lastRecognition) }
             } label: {
-                Image(systemName: "sparkles")
-                    .font(.subheadline.weight(.semibold))
-                    .padding(9)
-                    .background(.ultraThinMaterial, in: Circle())
+                icon("arrow.triangle.2.circlepath")
             }
 
-            Spacer()
+            Button { showSettings = true } label: {
+                icon("gearshape")
+            }
+
+            Spacer(minLength: 4)
 
             Text(buildTag)
                 .font(.caption2.weight(.black))
@@ -150,22 +152,53 @@ struct ContentView: View {
                 .foregroundStyle(.black)
         }
         .foregroundStyle(.white)
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 12)
         .padding(.top, 12)
+    }
+
+    private func icon(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.subheadline.weight(.semibold))
+            .padding(9)
+            .background(.ultraThinMaterial, in: Circle())
     }
 
     /// 只是拍前预览，不会进画面；真正烧录由 TextLayer 完成
     private var copyPreview: some View {
-        VStack(spacing: 2) {
+        VStack(spacing: 3) {
+            HStack(spacing: 6) {
+                Text(copyEngine.badge)
+                    .font(.system(size: 9, weight: .black))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1.5)
+                    .background(copyEngine.badge == "AI" ? Color.orange : Color.white.opacity(0.28),
+                                in: Capsule())
+                    .foregroundStyle(.white)
+                if aiSettings.config.enabled == false {
+                    Text("未启用 AI")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.55))
+                }
+            }
+
             ForEach(copyEngine.lines.indices, id: \.self) { index in
                 Text(copyEngine.lines[index])
                     .font(.system(size: 13, weight: .bold))
                     .foregroundStyle(.white)
-                    .shadow(color: .black.opacity(0.8), radius: 3)
+                    .multilineTextAlignment(.center)
+                    .shadow(color: .black.opacity(0.85), radius: 2.5)
+            }
+
+            if let note = copyEngine.note {
+                Text(note)
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(.white.opacity(0.65))
+                    .multilineTextAlignment(.center)
+                    .padding(.top, 1)
             }
         }
         .padding(.horizontal, 16)
-        .padding(.top, 12)
+        .padding(.top, 10)
     }
 
     private var statusBar: some View {
@@ -219,12 +252,22 @@ struct ContentView: View {
         }
     }
 
-    // MARK: 一次快门 = 完整链路，全程不需要第二个人工步骤
+    // MARK: 一次快门 = 完整链路
 
     private func shoot() {
         guard !working else { return }
         phase = .recording
-        statusText = "录制 5 秒…"
+        lastError = nil
+        lastRecognition = nil
+        statusText = aiSettings.config.autoRecognize
+            ? "录制中 · 同时识别画面、写文案…"
+            : "录制 5 秒…"
+
+        // 按下快门立刻抓一帧，识别和写文案在录制这 5 秒里并行跑完
+        copyJob = Task { @MainActor in
+            let frame = await camera.snapshot()
+            await prepareCopy(frame: frame)
+        }
 
         camera.capture(seconds: 5.0) { result in
             switch result {
@@ -238,44 +281,103 @@ struct ContentView: View {
         }
     }
 
+    // MARK: 识别 + 写文案
+
+    /// frame 为 nil 表示没抓到画面，此时只走 AI（无图）/ 本地模板
+    @MainActor
+    private func prepareCopy(frame: CGImage?) async {
+        var recognition: Recognition?
+
+        if let frame, aiSettings.config.autoRecognize {
+            statusText = "识别商品…"
+            recognition = await ProductRecognizer.analyze(frame: frame,
+                                                           products: copyEngine.products)
+            lastRecognition = recognition
+            if let hit = recognition?.localHit {
+                copyEngine.select(hit)
+            }
+            if let recognition { statusText = recognition.summary }
+        }
+
+        guard aiSettings.config.enabled,
+              !aiSettings.config.apiKey.trimmingCharacters(in: .whitespaces).isEmpty else {
+            return
+        }
+
+        // 关掉「每次拍摄重新生成」时，沿用上一条 AI 文案
+        if !aiSettings.config.autoGenerateOnShoot,
+           copyEngine.badge == "AI",
+           !copyEngine.lines.isEmpty {
+            return
+        }
+
+        statusText = "AI 写文案…"
+        var jpeg: Data?
+        if aiSettings.config.useVision, let frame {
+            jpeg = ProductRecognizer.jpegPreview(frame)
+        }
+        _ = await copyEngine.generateWithAI(config: aiSettings.config,
+                                            recognition: recognition,
+                                            imageJPEG: jpeg)
+        if let note = copyEngine.note { statusText = note }
+    }
+
+    // MARK: 烧字 + 写相册
+
     private func process(_ source: URL) {
-        phase = .processing
-        statusText = "匹配文案 → 逐帧烧录 → 写入相册…"
+        Task { @MainActor in
+            phase = .processing
+            statusText = "整理文案…"
 
-        let asset = AVAsset(url: source)
-        guard let track = asset.tracks(withMediaType: .video).first else {
-            phase = .failed("没有视频轨")
-            statusText = "素材里没有视频轨"
-            return
-        }
-        let natural = track.naturalSize.applying(track.preferredTransform)
-        let size = CGSize(width: abs(natural.width), height: abs(natural.height))
-        guard let overlay = TextLayer.make(lines: copyEngine.lines, size: size) else {
-            phase = .failed("文案渲染失败")
-            statusText = "文案渲染失败，请先选商品"
-            return
-        }
+            // 等录制期间那条并行任务收尾
+            await copyJob?.value
+            copyJob = nil
 
-        BurnEngine.render(source: source, overlay: overlay) { burned in
-            switch burned {
-            case .failure(let error):
-                self.phase = .failed(error.localizedDescription)
-                self.lastError = "处理失败\n" + error.localizedDescription
-                self.statusText = "处理失败：\(error.localizedDescription)"
-            case .success(let output):
-                LivePhotoWriter.save(still: output.stillURL, video: output.videoURL,
-                                     report: output.report) { saved in
-                    switch saved {
-                    case .success:
-                        self.phase = .done
-                        self.lastError = nil
-                        self.statusText = "已存入相册 · 抖音「+ → 相册 → 动图」直接发"
-                    case .failure(let error):
-                        self.phase = .failed(error.localizedDescription)
-                        self.lastError = "\(self.buildTag) 写入相册失败\n" + error.localizedDescription
-                        self.statusText = "写入相册失败（详情见下方）"
+            // 快门那一刻没抓到画面时，退化成从成片首帧识别
+            if lastRecognition == nil, aiSettings.config.autoRecognize,
+               let frame = BurnEngine.previewFrame(from: source) {
+                await prepareCopy(frame: frame)
+            }
+
+            if copyEngine.lines.isEmpty { copyEngine.regenerate() }
+
+            guard let track = AVAsset(url: source).tracks(withMediaType: .video).first else {
+                phase = .failed("没有视频轨")
+                statusText = "素材里没有视频轨"
+                return
+            }
+            let natural = track.naturalSize.applying(track.preferredTransform)
+            let renderSize = CGSize(width: abs(natural.width), height: abs(natural.height))
+            guard let overlay = TextLayer.make(lines: copyEngine.lines, size: renderSize) else {
+                phase = .failed("文案渲染失败")
+                statusText = "文案渲染失败，请先选商品"
+                return
+            }
+
+            statusText = "烧录字幕 → 写入相册…"
+            do {
+                let output = try await withCheckedThrowingContinuation {
+                    (continuation: CheckedContinuation<BurnOutput, Error>) in
+                    BurnEngine.render(source: source, overlay: overlay) { result in
+                        continuation.resume(with: result)
                     }
                 }
+                statusText = "写入相册…"
+                try await withCheckedThrowingContinuation {
+                    (continuation: CheckedContinuation<Void, Error>) in
+                    LivePhotoWriter.save(still: output.stillURL,
+                                         video: output.videoURL,
+                                         report: output.report) { result in
+                        continuation.resume(with: result)
+                    }
+                }
+                phase = .done
+                lastError = nil
+                statusText = "已存入相册 · 抖音「+ → 相册 → 动图」直接发"
+            } catch {
+                phase = .failed(error.localizedDescription)
+                lastError = "\(buildTag) 失败\n" + error.localizedDescription
+                statusText = "处理失败（详情见下方）"
             }
         }
     }
