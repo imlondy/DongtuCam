@@ -141,6 +141,7 @@ final class ShotStore {
             } else {
                 message = nil
             }
+            Diagnostics.mark("store.recover-done")
             DispatchQueue.main.async { completion(message) }
             return
         }
@@ -175,6 +176,7 @@ final class ShotStore {
             Diagnostics.mark("store.recover-still")
             LivePhotoWriter.saveStill(still) { result in
                 let ok = result.isSuccess
+                Diagnostics.mark(ok ? "store.recover-still-ok" : "store.recover-still-fail")
                 if ok { self.finish(shot.id) }
                 self.recoverNext(rest, saved: saved + (ok ? 1 : 0),
                                  failed: failed + (ok ? 0 : 1), completion: completion)
@@ -186,6 +188,7 @@ final class ShotStore {
             Diagnostics.mark("store.recover-video")
             LivePhotoWriter.saveVideo(source) { result in
                 let ok = result.isSuccess
+                Diagnostics.mark(ok ? "store.recover-video-ok" : "store.recover-video-fail")
                 if ok { self.finish(shot.id) }
                 self.recoverNext(rest, saved: saved + (ok ? 1 : 0),
                                  failed: failed + (ok ? 0 : 1), completion: completion)
