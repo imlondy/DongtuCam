@@ -14,144 +14,123 @@ struct BurnOutput {
 
 enum BurnEngineError: LocalizedError {
     case noVideoTrack
+    case composeFailed(String)
     case writerFailed(String)
     case stillFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .noVideoTrack: return "素材里没有视频轨"
-        case .writerFailed(let r): return "视频导出失败：\(r)"
+        case .composeFailed(let r): return "静帧合成失败：\(r)"
+        case .writerFailed(let r): return "视频封装失败：\(r)"
         case .stillFailed(let r): return "静帧生成失败：\(r)"
         }
     }
 }
 
-/// 产出一对能配成实况照片的文件：带文字的 HEIC 静帧 + 带文字的 MOV 视频。
+/// 产出一对能配成实况照片的文件：带文字的 HEIC 静帧 + 原始 MOV 视频。
+///
+/// ## v14 的两个关键改动（都来自真机反馈）
+///
+/// 1. **文字只合成到静帧上，视频一点不碰。**
+///    以前文字是烧进视频再抽一帧当静帧，于是：字跟着画面/播放动效一起动，
+///    而且一路经历「CIImage 缩放 → HEVC 编码 → 解码抽帧 → HEIC 编码」，
+///    每一环都是丢细节，最后当然是一团糊。现在静帧是
+///    「原始首帧 + CoreGraphics 文字层」一次性合成，文字按像素 1:1 绘制，
+///    没有任何重采样，边缘是干净的抗锯齿。
+///
+/// 2. **去掉 AVAssetExportSession + applyingCIFiltersWithHandler 整条链路。**
+///    那是 v11~v13 每轮闪退的共同起点（VideoToolbox 编码 + CI 每帧回调，
+///    1080p 5 秒的峰值内存和内部断言都不受我们控制）。现在视频走
+///    `AVAssetReader → AVAssetWriter` 的 passthrough，不解码、不重编码，
+///    只是重新封装并写入两条配对元数据——这一步在 v10 起就稳定。
 ///
 /// 实况照片能不能存进相册，取决于三件事，缺一项就是 PHPhotosErrorDomain 3302：
-///   1. 静帧必须是 **HEIC**，且 iPhone 内部 MakerApple 的 "17" 字段 == 配对标识
-///      （iOS 15.1 起 JPEG 已不再写这个字段，用 JPEG 必失败）；
+///   1. 静帧必须是 **HEIC**，且 iPhone 内部 MakerApple 的 "17" 字段 == 配对标识；
 ///   2. 视频的文件级元数据里 com.apple.quicktime.content.identifier == 同一个标识；
 ///   3. 视频里必须有一条 timed metadata 轨道 com.apple.quicktime.still-image-time
 ///      （值 0xFF，即 SInt8 的 -1），告诉系统封面静帧对应哪一帧。
 enum BurnEngine {
-    static func render(source: URL, overlay: CGImage, seconds: Double = 5.0,
-                       completion: @escaping (Result<BurnOutput, Error>) -> Void) {
-        let asset = AVAsset(url: source)
-        guard asset.tracks(withMediaType: .video).first != nil else {
-            completion(.failure(BurnEngineError.noVideoTrack))
-            return
-        }
+    /// - Parameters:
+    ///   - source: 相机原始录制文件（未做任何处理）
+    ///   - frame: 已转正的首帧，用来做静帧底图（尺寸 = 成片尺寸）
+    ///   - overlay: 与 frame 同尺寸的透明文字层
+    static func compose(source: URL, frame: CGImage, overlay: CGImage,
+                        completion: @escaping (Result<BurnOutput, Error>) -> Void) {
         let identifier = UUID().uuidString
-        let textCI = CIImage(cgImage: overlay)
-        let duration = CMTimeMinimum(asset.duration,
-                                     CMTime(seconds: seconds, preferredTimescale: 600))
 
-        // —— ① 烧字导出（不手动设 renderSize/frameDuration，避免抽帧崩溃）——
-        // 文字层只做「等比」缩放并顶部对齐。绝不能 X/Y 分开缩放：
-        // 一旦两轴比例不同，字会被横向拉宽、纵向压扁，看上去就是一坨黑块。
-        let context = sharedContext
-        let composition = AVMutableVideoComposition(
-            asset: asset,
-            applyingCIFiltersWithHandler: { request in
-                let src = request.sourceImage
-                let srcExtent = src.extent
-                let textExtent = textCI.extent
-                guard textExtent.width > 1, textExtent.height > 1,
-                      srcExtent.width > 1, srcExtent.height > 1 else {
-                    request.finish(with: src, context: nil)
-                    return
+        // 重活全部离开主线程：合成 + HEIC 编码 + 封装，主线程只负责刷 UI
+        DispatchQueue.global(qos: .userInitiated).async {
+            var notes: [String] = []
+            Diagnostics.mark("burn.flatten")
+
+            let composed = autoreleasepool { flatten(frame: frame, overlay: overlay) }
+            guard let composed else {
+                DispatchQueue.main.async {
+                    completion(.failure(BurnEngineError.composeFailed("画布创建失败")))
                 }
-                let scale = srcExtent.width / textExtent.width
-                var fitted = textCI.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-                let dx = srcExtent.minX - fitted.extent.minX
-                let dy = srcExtent.maxY - fitted.extent.maxY
-                fitted = fitted.transformed(by: CGAffineTransform(translationX: dx, y: dy))
-                request.finish(with: fitted.composited(over: src), context: context)
-            })
-
-        // HEVC 优先（与 HEIC 静帧同编码族，新系统校验更容易过），失败自动退回 H.264
-        let presets = [AVAssetExportPresetHEVCHighestQuality,
-                       AVAssetExportPresetHighestQuality]
-        export(source: asset, composition: composition, duration: duration,
-               presets: presets) { exported in
-            switch exported {
-            case .failure(let error):
-                completion(.failure(error))
-            case .success(let burned):
-                // —— ② 无损重封装，注入两条配对元数据 ——
-                remux(videoURL: burned, identifier: identifier) { remuxed in
-                    switch remuxed {
-                    case .failure(let error):
-                        completion(.failure(error))
-                    case .success(let finalVideo):
-                        finish(videoURL: finalVideo, identifier: identifier,
-                               completion: completion)
-                    }
-                }
-            }
-        }
-    }
-
-    /// ③ 出静帧 + 自检
-    private static func finish(videoURL: URL, identifier: String,
-                               completion: @escaping (Result<BurnOutput, Error>) -> Void) {
-        // 关键：静帧从「已烧字的成片」抽，尺寸/朝向与视频天然一致，
-        // 避免「图片竖屏 1080x1440、视频横屏 1920x1080」这种配对不一致。
-        guard let frame = stillFrame(videoURL: videoURL) else {
-            completion(.failure(BurnEngineError.stillFailed("无法解码视频帧")))
-            return
-        }
-        var notes: [String] = []
-        guard let made = makeStill(frame, identifier: identifier, notes: &notes) else {
-            completion(.failure(BurnEngineError.stillFailed(notes.joined(separator: " / "))))
-            return
-        }
-        let stillURL = tmpURL(made.1)
-        guard (try? made.0.write(to: stillURL)) != nil else {
-            completion(.failure(BurnEngineError.stillFailed("静帧落盘失败")))
-            return
-        }
-        let report = selfCheck(stillData: made.0, videoURL: videoURL, identifier: identifier)
-        completion(.success(BurnOutput(stillURL: stillURL, videoURL: videoURL,
-                                       identifier: identifier, report: report)))
-    }
-
-    /// 依次尝试多个导出预设，成功即返回
-    private static func export(source asset: AVAsset, composition: AVVideoComposition,
-                               duration: CMTime, presets: [String],
-                               completion: @escaping (Result<URL, Error>) -> Void) {
-        var queue = presets
-        var lastReason = "没有可用的导出预设"
-
-        func attempt() {
-            guard !queue.isEmpty else {
-                completion(.failure(BurnEngineError.writerFailed(lastReason)))
                 return
             }
-            let preset = queue.removeFirst()
-            guard let exporter = AVAssetExportSession(asset: asset, presetName: preset) else {
-                attempt()
+
+            Diagnostics.mark("burn.heic")
+            guard let made = makeStill(composed, identifier: identifier, notes: &notes) else {
+                DispatchQueue.main.async {
+                    completion(.failure(BurnEngineError.stillFailed(notes.joined(separator: " / "))))
+                }
                 return
             }
-            let url = tmpURL("intermediate.mov")
-            exporter.outputURL = url
-            exporter.outputFileType = .mov
-            exporter.videoComposition = composition
-            exporter.timeRange = CMTimeRange(start: .zero, duration: duration)
-            exporter.exportAsynchronously {
-                if exporter.status == .completed {
-                    completion(.success(url))
-                } else {
-                    lastReason = exporter.error?.localizedDescription
-                        ?? "status=\(exporter.status.rawValue)"
-                    attempt()
+            let stillData = made.0
+            let stillName = made.1
+
+            let stillURL = tmpURL(stillName)
+            guard (try? stillData.write(to: stillURL)) != nil else {
+                DispatchQueue.main.async {
+                    completion(.failure(BurnEngineError.stillFailed("静帧落盘失败")))
+                }
+                return
+            }
+
+            // 视频：原样 passthrough，只注入配对元数据
+            Diagnostics.mark("burn.remux")
+            remux(videoURL: source, identifier: identifier) { result in
+                switch result {
+                case .failure(let error):
+                    completion(.failure(error))
+                case .success(let finalVideo):
+                    Diagnostics.mark("burn.remux-ok")
+                    let report = selfCheck(stillData: stillData, stillURL: stillURL,
+                                           videoURL: finalVideo, identifier: identifier)
+                    completion(.success(BurnOutput(stillURL: stillURL,
+                                                   videoURL: finalVideo,
+                                                   identifier: identifier,
+                                                   report: report)))
                 }
             }
         }
-        attempt()
     }
 
+    /// 把首帧与文字层压成一张不透明位图（两者同尺寸，绝不缩放）
+    private static func flatten(frame: CGImage, overlay: CGImage) -> CGImage? {
+        let width = frame.width
+        let height = frame.height
+        guard width > 1, height > 1 else { return nil }
+        let size = CGSize(width: width, height: height)
+
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        // 固定 sRGB：广色域会让白字发灰、描边发糊
+        format.preferredRange = .standard
+
+        let image = UIGraphicsImageRenderer(size: size, format: format).image { ctx in
+            UIColor.black.setFill()
+            ctx.fill(CGRect(origin: .zero, size: size))
+            UIImage(cgImage: frame).draw(in: CGRect(origin: .zero, size: size))
+            // draw(_:in:) 在 1:1 的矩形里是像素直拷，不会引入模糊
+            UIImage(cgImage: overlay).draw(in: CGRect(origin: .zero, size: size))
+        }
+        return image.cgImage
+    }
 
     // MARK: - 视频：无损重封装 + 配对元数据
 
@@ -159,21 +138,34 @@ enum BurnEngine {
                               completion: @escaping (Result<URL, Error>) -> Void) {
         let asset = AVAsset(url: videoURL)
         guard let videoTrack = asset.tracks(withMediaType: .video).first else {
-            completion(.failure(BurnEngineError.writerFailed("中间视频没有视频轨")))
+            completion(.failure(BurnEngineError.noVideoTrack))
             return
         }
         let audioTrack = asset.tracks(withMediaType: .audio).first
-        let outURL = tmpURL("burn.mov")
+        let outURL = tmpURL("live.mov")
+
+        // 时长的兜底：个别机型刚停止录制时 duration 还是 indefinite，
+        // 直接拿它去建 timeRange 会抛异常
+        var duration = asset.duration
+        if !duration.isNumeric || duration.seconds <= 0 {
+            duration = CMTime(seconds: 5, preferredTimescale: 600)
+        }
 
         do {
             let reader = try AVAssetReader(asset: asset)
             let videoOut = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: nil)
+            guard reader.canAdd(videoOut) else {
+                completion(.failure(BurnEngineError.writerFailed("无法读取视频轨")))
+                return
+            }
             reader.add(videoOut)
             var audioOut: AVAssetReaderTrackOutput?
             if let audioTrack {
                 let o = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
-                reader.add(o)
-                audioOut = o
+                if reader.canAdd(o) {
+                    reader.add(o)
+                    audioOut = o
+                }
             }
 
             let writer = try AVAssetWriter(outputURL: outURL, fileType: .mov)
@@ -186,7 +178,7 @@ enum BurnEngine {
             if audioOut != nil {
                 let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
                 ai.expectsMediaDataInRealTime = false
-                // 必须逐个确认能否添加：直接 add 一个不被接受的输入会抛 ObjC 异常（闪退）
+                // 必须逐个确认能否添加：add 一个不被接受的输入会抛 ObjC 异常（闪退）
                 if writer.canAdd(ai) { audioInput = ai }
             }
 
@@ -208,7 +200,12 @@ enum BurnEngine {
                 return
             }
             writer.startSession(atSourceTime: .zero)
-            reader.startReading()
+            guard reader.startReading() else {
+                writer.cancelWriting()
+                completion(.failure(BurnEngineError.writerFailed("startReading 失败")))
+                return
+            }
+            Diagnostics.mark("burn.remux-writing")
 
             // 轨道级 still-image-time：必须写在第一个视频样本之前，值 0xFF(=SInt8 -1)
             let stillItem = AVMutableMetadataItem()
@@ -218,7 +215,7 @@ enum BurnEngine {
             stillItem.dataType = kCMMetadataBaseDataType_SInt8 as String
             adaptor.append(AVTimedMetadataGroup(
                 items: [stillItem],
-                timeRange: CMTimeRange(start: .zero, duration: asset.duration)))
+                timeRange: CMTimeRange(start: .zero, duration: duration)))
             metadataInput.markAsFinished()
 
             let group = DispatchGroup()
@@ -306,18 +303,6 @@ enum BurnEngine {
 
     // MARK: - 静帧
 
-    /// 从成片里抽一张「已经带字」的静帧（宽高与视频显示尺寸一致）
-    private static func stillFrame(videoURL: URL) -> CGImage? {
-        let asset = AVAsset(url: videoURL)
-        let generator = AVAssetImageGenerator(asset: asset)
-        generator.appliesPreferredTrackTransform = true
-        // 容差给宽松：某些机型首帧不在 0.1s 的精确位置上，零容差会直接取不到图
-        generator.requestedTimeToleranceBefore = .positiveInfinity
-        generator.requestedTimeToleranceAfter = .positiveInfinity
-        return try? generator.copyCGImage(at: CMTime(value: 1, timescale: 10),
-                                         actualTime: nil)
-    }
-
     /// 依次尝试三种 HEIC 写入方式，只接受「读回来能拿到 17 号标识」的结果。
     ///
     /// 从零编码 HEIC 时 ImageIO 会静默丢掉 MakerApple，所以主路径是：
@@ -363,7 +348,7 @@ enum BurnEngine {
                                                          "public.heic" as CFString, 1, nil) else {
             return nil
         }
-        var props: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.92]
+        var props: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.96]
         for (key, value) in extra { props[key] = value }
         CGImageDestinationAddImage(dest, image, props as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
@@ -421,7 +406,8 @@ enum BurnEngine {
 
     // MARK: - 自检（不依赖相册权限，纯读文件）
 
-    private static func selfCheck(stillData: Data, videoURL: URL, identifier: String) -> String {
+    private static func selfCheck(stillData: Data, stillURL: URL,
+                                  videoURL: URL, identifier: String) -> String {
         var parts: [String] = []
 
         var format = "?"
@@ -449,6 +435,12 @@ enum BurnEngine {
             let size = track.naturalSize.applying(track.preferredTransform)
             parts.append("vsize=\(Int(abs(size.width)))x\(Int(abs(size.height)))")
         }
+        if let source = CGImageSourceCreateWithURL(stillURL as CFURL, nil),
+           let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+           let w = props[kCGImagePropertyPixelWidth] as? Int,
+           let h = props[kCGImagePropertyPixelHeight] as? Int {
+            parts.append("ssize=\(w)x\(h)")
+        }
         return parts.joined(separator: " ")
     }
 
@@ -457,16 +449,14 @@ enum BurnEngine {
             .appendingPathComponent("dtc-\(UUID().uuidString)-\(name)")
     }
 
-    /// 共用一个 CIContext，避免每帧新建上下文（内存与首帧延迟都会明显变差）
-    private static let sharedContext: CIContext = CIContext(options: [
-        .cacheIntermediates: false
-    ])
-
-    /// 从成片里取一帧（已按 preferredTransform 转正），用于拍完后兜底识别商品
+    /// 从原始录制文件里取一帧（已按 preferredTransform 转正）。
+    /// 既是静帧底图，也是商品识别的输入。
     static func previewFrame(from url: URL, at seconds: Double = 0.1) -> CGImage? {
         let asset = AVAsset(url: url)
+        guard asset.tracks(withMediaType: .video).first != nil else { return nil }
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
+        // 容差给宽松：某些机型首帧不在精确位置上，零容差会直接取不到图
         generator.requestedTimeToleranceBefore = .positiveInfinity
         generator.requestedTimeToleranceAfter = .positiveInfinity
         return try? generator.copyCGImage(at: CMTime(seconds: seconds, preferredTimescale: 600),
