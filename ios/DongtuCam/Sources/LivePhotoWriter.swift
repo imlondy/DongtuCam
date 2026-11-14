@@ -16,21 +16,18 @@ enum LivePhotoWriterError: LocalizedError {
 
 /// 把「带文字的 HEIC 静帧 + 带文字的 MOV」交给 PhotoKit 配成一张实况照片。
 ///
-/// 这里刻意贴着 Apple 官方可运行的写法（见 iOS 26 实况照片保存问题的官方示例）：
+/// 配对本身靠文件内部标识（图片 MakerApple 17 == 视频 content.identifier
+/// + still-image-time 轨），这一点已用 PHLivePhoto.request 现场验证（pair=ok）。
+/// 真机实测剩下的失败点是「资源怎么递给 PhotoKit」：报
+/// `PHPhotosErrorDomain -1` 且带 `_PHResourceUrlsErrorKey`，
+/// 说明 PhotoKit 读不了以 fileURL 形式提交的那个视频。
 ///
-///     let creation = PHAssetCreationRequest.forAsset()
-///     creation.addResource(with: .photo, data: stillData, options: nil)
-///     let opts = PHAssetResourceCreationOptions()
-///     opts.shouldMoveFile = true
-///     creation.addResource(with: .pairedVideo, fileURL: movieURL, options: opts)
-///
-/// 关键点：
-///   · **不要**给资源设 uniformTypeIdentifier = "com.apple.live-photo"。
-///     那样 PhotoKit 会把资源当成「实况容器」而不是 HEIC/MOV，直接判资源无效（3302）。
-///     配对靠的是文件内部的标识（图片 MakerApple 17 == 视频 content.identifier），
-///     不是靠 UTI 声明。
-///   · 静帧必须是 HEIC（iOS 15.1 起 JPEG 无法携带 MakerApple 17）。
-///   · 两个资源必须在同一次 performChanges 里提交，否则会变成「一张照片 + 一段视频」。
+/// 因此按「最不容易出错」到「最传统」的顺序依次尝试：
+///   A. 图片 data + 视频 data（完全不涉及文件 URL）
+///   B. 图片 data + 视频 fileURL（不移动文件）
+///   C. 图片 data + 视频 fileURL + shouldMoveFile（Apple 官方示例写法）
+/// 若三种都被拒，再升级到「完整相册权限」用 A 重试一次
+/// （部分系统在 addOnly 权限下会拒绝创建实况）。
 enum LivePhotoWriter {
     static func save(still: URL, video: URL, report: String = "",
                      completion: @escaping (Result<Void, Error>) -> Void) {
@@ -38,25 +35,83 @@ enum LivePhotoWriter {
             completion(.failure(LivePhotoWriterError.failed("无法读取静帧文件")))
             return
         }
+        guard let videoData = try? Data(contentsOf: video) else {
+            completion(.failure(LivePhotoWriterError.failed("无法读取视频文件")))
+            return
+        }
 
-        authorize { allowed in
+        authorize(addOnly: true) { allowed in
             guard allowed else {
                 completion(.failure(LivePhotoWriterError.denied))
                 return
             }
-            // 写相册前先让系统自己认一遍这对资源：能认成 PHLivePhoto，配对元数据才算真对。
+            // 写库前先让系统认一遍这对文件：能认成 PHLivePhoto 说明配对元数据正确
             preflight(still: still, video: video) { note in
-                commit(stillData: stillData, video: video,
-                       context: [report, note].filter { !$0.isEmpty }.joined(separator: " "),
-                       completion: completion)
+                let context = [report, note].filter { !$0.isEmpty }.joined(separator: " ")
+                attempt(0, stillData: stillData, videoData: videoData, videoURL: video,
+                        context: context) { result in
+                    switch result {
+                    case .success:
+                        completion(.success(()))
+                    case .failure(let lastError):
+                        // 兜底：升级到完整相册权限，再用 data 方式试一次
+                        authorize(addOnly: false) { full in
+                            guard full else {
+                                completion(.failure(lastError))
+                                return
+                            }
+                            commit(mode: .bothData, stillData: stillData,
+                                   videoData: videoData, videoURL: video,
+                                   context: context) { retried in
+                                switch retried {
+                                case .success:
+                                    completion(.success(()))
+                                case .failure:
+                                    completion(.failure(lastError))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - 依次尝试三种提交方式
+
+    private enum Mode: String {
+        case bothData = "A(图data+视频data)"
+        case urlNoMove = "B(图data+视频url)"
+        case urlMove = "C(图data+视频url+move)"
+    }
+
+    private static let modes: [Mode] = [.bothData, .urlNoMove, .urlMove]
+
+    private static func attempt(_ index: Int, stillData: Data, videoData: Data,
+                                videoURL: URL, context: String,
+                                completion: @escaping (Result<Void, Error>) -> Void) {
+        guard index < modes.count else {
+            completion(.failure(LivePhotoWriterError.failed(
+                "三种提交方式均被系统拒绝 · \(String(context.suffix(140)))")))
+            return
+        }
+        commit(mode: modes[index], stillData: stillData, videoData: videoData,
+               videoURL: videoURL, context: context) { result in
+            switch result {
+            case .success:
+                completion(.success(()))
+            case .failure:
+                attempt(index + 1, stillData: stillData, videoData: videoData,
+                        videoURL: videoURL, context: context, completion: completion)
             }
         }
     }
 
     // MARK: - 权限
 
-    private static func authorize(_ done: @escaping (Bool) -> Void) {
-        let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+    private static func authorize(addOnly: Bool, _ done: @escaping (Bool) -> Void) {
+        let level: PHAccessLevel = addOnly ? .addOnly : .readWrite
+        let status = PHPhotoLibrary.authorizationStatus(for: level)
         if status == .authorized || status == .limited {
             done(true)
             return
@@ -65,7 +120,7 @@ enum LivePhotoWriter {
             done(false)
             return
         }
-        PHPhotoLibrary.requestAuthorization(for: .addOnly) { next in
+        PHPhotoLibrary.requestAuthorization(for: level) { next in
             let ok = (next == .authorized || next == .limited)
             DispatchQueue.main.async { done(ok) }
         }
@@ -79,54 +134,58 @@ enum LivePhotoWriter {
                             placeholderImage: nil,
                             targetSize: .zero,
                             contentMode: .aspectFit) { photo, info in
-            let note: String
-            if photo != nil {
-                note = "pair=ok"
-            } else {
-                note = "pair=nil\(errorCode(info))"
+            var note = photo != nil ? "pair=ok" : "pair=nil"
+            if photo == nil, let error = info[PHLivePhotoInfoErrorKey] as? NSError {
+                note += "(\(error.code))"
             }
             DispatchQueue.main.async { done(note) }
         }
     }
 
-    private static func errorCode(_ info: [AnyHashable: Any]) -> String {
-        if let error = info[PHLivePhotoInfoErrorKey] as? NSError {
-            return "(\(error.domain) \(error.code))"
-        }
-        return ""
-    }
-
     // MARK: - 提交
 
-    private static func commit(stillData: Data, video: URL, context: String,
+    private static func commit(mode: Mode, stillData: Data, videoData: Data,
+                               videoURL: URL, context: String,
                                completion: @escaping (Result<Void, Error>) -> Void) {
+        let sizeMB = Double(videoData.count) / 1024.0 / 1024.0
         PHPhotoLibrary.shared().performChanges {
             let creation = PHAssetCreationRequest.forAsset()
-            // 官方写法：静帧用 data + options: nil，让 PhotoKit 从数据本身判断类型（HEIC）
+
+            // 静帧：官方写法用 data + options: nil（PhotoKit 从数据本身判断是 HEIC）
             creation.addResource(with: .photo, data: stillData, options: nil)
 
-            let videoOptions = PHAssetResourceCreationOptions()
-            videoOptions.shouldMoveFile = true
-            creation.addResource(with: .pairedVideo, fileURL: video, options: videoOptions)
+            switch mode {
+            case .bothData:
+                let videoOptions = PHAssetResourceCreationOptions()
+                videoOptions.originalFilename = "IMG_LIVE.MOV"
+                creation.addResource(with: .pairedVideo, data: videoData, options: videoOptions)
+            case .urlNoMove, .urlMove:
+                let videoOptions = PHAssetResourceCreationOptions()
+                videoOptions.originalFilename = "IMG_LIVE.MOV"
+                videoOptions.shouldMoveFile = (mode == .urlMove)
+                creation.addResource(with: .pairedVideo, fileURL: videoURL, options: videoOptions)
+            }
         } completionHandler: { success, error in
             DispatchQueue.main.async {
                 if success {
                     completion(.success(()))
                     return
                 }
-                var message = error?.localizedDescription ?? "unknown"
+                var message = "[\(mode.rawValue)] "
                 if let nsError = error {
                     let ns = nsError as NSError
+                    message += "错误 \(ns.code)"
                     let keys = ns.userInfo.keys
                         .map { "\($0)" }
                         .filter { $0.contains("PH") || $0.contains("Resource") }
                         .sorted()
                         .joined(separator: ",")
                     if !keys.isEmpty { message += " [\(keys)]" }
+                } else {
+                    message += "未知错误"
                 }
-                if !context.isEmpty {
-                    message += " · \(String(context.prefix(150)))"
-                }
+                message += String(format: " · 视频%.1fMB", sizeMB)
+                if !context.isEmpty { message += " · \(String(context.suffix(120)))" }
                 completion(.failure(LivePhotoWriterError.failed(message)))
             }
         }
