@@ -4,7 +4,7 @@ import UIKit
 
 /// 构建标识：界面右上角显示，同时写进崩溃日志的启动行。
 /// 崩溃现场靠它区分「这次崩的是哪个包」—— 装错包、或看到上一版的旧现场时一眼能认出。
-let appBuildTag = "v28"
+let appBuildTag = "v29"
 
 @main
 struct DongtuCamApp: App {
@@ -94,14 +94,14 @@ struct ContentView: View {
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
     private let buildTag = appBuildTag
 
-    /// 单次拍摄时长（秒）。
+    /// 单次拍摄时长（秒），设置页可改。
     ///
-    /// **3.2 是平台的硬约束，不是审美选择**：
-    /// - 剪映导出实况时会提示「实况图最长 3.9 秒，部分平台无法正常播放超此时长的实况图」；
-    /// - 抖音自己拍的「动图」也是 3 秒左右；
-    /// - iOS 原生实况本身就是 3 秒（前后各 1.5s）。
-    /// 之前录 5 秒，实况超出规格，抖音那边就容易降级成普通图文（没有动效、没有动图角标）。
-    private static let captureSeconds: Double = 3.2
+    /// 这个值直接决定抖音怎么处理成片，所以不写死：
+    /// - 抖音自己拍的「动图」≈3 秒，播放器才给「动图」角标；
+    /// - 剪映导出实况的硬提示是「不超过 3.9 秒，部分平台无法播放超此时长的实况图」；
+    /// - 5 秒也能发，但画面越长越容易被当成普通视频/图文。
+    /// 默认 3 秒（最接近抖音原生动图），想拍长一点在设置里切 4 / 5 秒。
+    @AppStorage("dtc.captureSeconds") private var captureSeconds: Double = 3.0
 
     /// 取景框矩形：**成片画幅**，垂直居中在「顶栏与快门之间」的那段空间里。
     ///
@@ -558,14 +558,14 @@ struct ContentView: View {
         phase = .recording
         lastError = nil
         lastRecognition = nil
-        statusText = "录制 \(Int(Self.captureSeconds.rounded())) 秒…"
+        statusText = "录制 \(Int(captureSeconds.rounded())) 秒…"
         Diagnostics.mark("shutter")
 
         // 快门按下的这一刻，屏幕上是什么字，成片就是什么字。
         // 处理期间 AI 可能又换了一条文案，那是给下一拍用的。
         let shotLines = copyEngine.lines
 
-        camera.capture(seconds: Self.captureSeconds) { result in
+        camera.capture(seconds: captureSeconds) { result in
             switch result {
             case .failure(let error):
                 self.phase = .failed(error.localizedDescription)
