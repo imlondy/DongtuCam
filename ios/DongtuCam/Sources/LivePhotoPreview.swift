@@ -133,6 +133,8 @@ struct LivePhotoPreviewSheet: View {
     @State private var livePhoto: PHLivePhoto?
     @State private var status = "载入动图…"
     @State private var albumUnavailable = false
+    /// 没装抖音 / 查不到 scheme 时给一句提示，别让按钮点了没反应
+    @State private var douyinMissing = false
     @State private var motionState: MotionSaveState = .idle
     @State private var showShare = false
     @State private var preparing = false
@@ -221,11 +223,14 @@ struct LivePhotoPreviewSheet: View {
                         }
                     }
 
-                    // 验收标准只有一条：抖音**发布页左上角**有没有「动图」标。
-                    // 那是抖音收到素材时的即时判定，比发布后的作品页更早、更准。
+                    // 抖音发布页左上角那个「动图」标，只出现在它自家 SDK 投稿的素材上：
+                    // 系统分享进来的内容走的是「文件导入」流水线，不带这个标。
+                    // 最后一条低成本路径：把 PHLivePhoto **对象**交给系统分享 ——
+                    // 这是 iOS 里唯一能把「实况照片」成对交付给接收方的方式，
+                    // 系统会以 com.apple.live-photo 类型注册，而不是拆成一张图或一段视频。
                     VStack(spacing: 3) {
-                        Text("验收标准：抖音发布页左上角出现「动图」标")
-                        Text("出现了就成了；没有就换下面的「实况包」再试一次")
+                        Text("点「分享实况给抖音」，看发布页左上角有没有「动图」")
+                        Text("这条再不行，就只剩抖音开放平台 SDK 了")
                     }
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.yellow.opacity(0.85))
@@ -233,12 +238,11 @@ struct LivePhotoPreviewSheet: View {
                     .padding(.horizontal, 24)
 
                     HStack(spacing: 10) {
-                        // 主路径：把**带实况标记的原片**交给抖音。
-                        // 之前几版都先转码成 mp4 —— AVAssetExportSession 会把
-                        // content.identifier 和 still-image-time 一起丢掉，
-                        // 抖音收到的是个干净视频，发布页自然没有「动图」标。
-                        if shot.videoURL != nil {
-                            Button { share(.liveMovie) } label: {
+                        // 有 PHLivePhoto 就交实况对象；没有就退回带标记的原片。
+                        // 之前几版都先转码成 mp4 —— AVAssetExportSession 会连
+                        // content.identifier 和 still-image-time 一起丢掉。
+                        if livePhoto != nil || shot.videoURL != nil {
+                            Button { share(livePhoto != nil ? .livePhotoObject : .liveMovie) } label: {
                                 Group {
                                     if preparing {
                                         HStack(spacing: 7) {
@@ -246,7 +250,7 @@ struct LivePhotoPreviewSheet: View {
                                             Text("准备…")
                                         }
                                     } else {
-                                        Label("发布到抖音", systemImage: "square.and.arrow.up")
+                                        Label("分享实况给抖音", systemImage: "square.and.arrow.up")
                                     }
                                 }
                                 .font(.subheadline.weight(.semibold))
@@ -258,8 +262,10 @@ struct LivePhotoPreviewSheet: View {
                             .disabled(preparing)
                         }
 
-                        Button(action: openAlbum) {
-                            Label("相册", systemImage: "photo.on.rectangle.angled")
+                        // 少走几步的捷径：存进相册后直接跳抖音，
+                        // 从「+ → 相册 → 动图」进去发（这条已验证能出角标）
+                        Button(action: openDouyin) {
+                            Label("打开抖音", systemImage: "arrow.up.forward.app")
                                 .font(.subheadline.weight(.semibold))
                                 .padding(.horizontal, 18)
                                 .padding(.vertical, 12)
@@ -268,12 +274,19 @@ struct LivePhotoPreviewSheet: View {
                         }
                     }
 
-                    // 对照实验：同一条成片，三种交付形态各发一次。
-                    // 抖音的判定条件不公开，与其继续猜，不如让它自己给出答案。
-                    if shot.videoURL != nil {
-                        HStack(spacing: 8) {
+                    HStack(spacing: 8) {
+                        Button(action: openAlbum) {
+                            Label("相册", systemImage: "photo.on.rectangle.angled")
+                                .font(.caption2.weight(.medium))
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(.white.opacity(0.12), in: Capsule())
+                                .foregroundStyle(.white.opacity(0.9))
+                        }
+
+                        if shot.videoURL != nil {
                             Button { share(.liveBundle) } label: {
-                                Label("实况包 HEIC+MOV", systemImage: "rectangle.stack")
+                                Label("HEIC+MOV", systemImage: "rectangle.stack")
                                     .font(.caption2.weight(.medium))
                                     .padding(.horizontal, 12)
                                     .padding(.vertical, 8)
@@ -333,6 +346,14 @@ struct LivePhotoPreviewSheet: View {
                             .foregroundStyle(.orange.opacity(0.85))
                             .multilineTextAlignment(.center)
                             .padding(.horizontal, 26)
+                    }
+
+                    if douyinMissing {
+                        Text("没找到抖音（或系统不允许查询）：手动打开抖音，从「+ → 相册 → 动图」选这张")
+                            .font(.caption2)
+                            .foregroundStyle(.white.opacity(0.55))
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 30)
                     }
 
                     if albumUnavailable {
@@ -440,25 +461,57 @@ struct LivePhotoPreviewSheet: View {
         }
     }
 
-    /// 交给抖音的三种形态。抖音的判定条件没公开，只能让它自己挑。
+    /// 直接跳抖音。
+    ///
+    /// 已验证能出「动图」角标的路径是「抖音内 + → 相册 → 动图」，
+    /// 但那条要手动翻两层。这里省掉找 App 的那一步。
+    /// `canOpenURL` 需要 Info.plist 里声明 `LSApplicationQueriesSchemes`，
+    /// 否则永远返回 false（系统不会告诉你装没装）。
+    private func openDouyin() {
+        let schemes = ["snssdk1128://", "douyinopensdk://"]
+        for scheme in schemes {
+            guard let url = URL(string: scheme) else { continue }
+            if UIApplication.shared.canOpenURL(url) {
+                Diagnostics.mark("douyin.open-ok")
+                UIApplication.shared.open(url, options: [:], completionHandler: nil)
+                return
+            }
+        }
+        Diagnostics.mark("douyin.not-installed")
+        douyinMissing = true
+    }
+
+    /// 交给抖音的几种形态。抖音的判定条件没公开，只能让它自己挑。
     private enum ShareMode {
-        /// 带实况标记的原片 .mov（首选）：H.264 + content.identifier + still-image-time
+        /// 把 PHLivePhoto **对象**交给系统分享。
+        /// 系统会以 `com.apple.live-photo` 注册到一个 NSItemProvider 上，
+        /// 接收方拿到的是成对的静帧 + 视频，而不是被拆开的某一样。
+        case livePhotoObject
+        /// 带实况标记的原片 .mov：H.264 + content.identifier + still-image-time
         case liveMovie
-        /// HEIC + MOV 两项一起给：构成完整的实况，抖音若按配对解析就会认出「动图」
+        /// HEIC + MOV 两项一起给
         case liveBundle
-        /// 转码成 mp4 的纯视频（对照用，历史上就是这条没有「动图」标）
+        /// 转码成 mp4 的纯视频（对照用）
         case compatMP4
     }
 
     /// 打开系统分享面板，把这一拍的素材交给抖音。
     ///
-    /// **绝对不能再无条件转码**：`AVAssetExportSession` 只搬音视频轨，
+    /// **不能无条件转码**：`AVAssetExportSession` 只搬音视频轨，
     /// 文件级的 `com.apple.quicktime.content.identifier` 和轨级的
-    /// `still-image-time` 都会被丢掉。抖音收到一个干净 mp4，发布页左上角
-    /// 就不会出现「动图」标 —— 这正是 v32/v33 的症状。
+    /// `still-image-time` 都会被丢掉，抖音收到一个干净 mp4。
     private func share(_ mode: ShareMode) {
         guard !preparing else { return }
         switch mode {
+        case .livePhotoObject:
+            guard let photo = livePhoto else {
+                share(.liveMovie)
+                return
+            }
+            Diagnostics.mark("share.live-photo-obj")
+            shareItems = [photo]
+            showShare = true
+
         case .liveMovie:
             guard let url = shot.videoURL else { return }
             Diagnostics.mark("share.live-movie")
