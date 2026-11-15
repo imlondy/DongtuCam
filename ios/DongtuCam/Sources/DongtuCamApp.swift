@@ -166,6 +166,10 @@ struct ContentView: View {
                         }
                 }
             }
+            // 键盘弹起时**不要**把取景框挤小：
+            // 画面一缩，同一份 sizeRatio 画出来的字在屏幕上就变小了，
+            // 边打字边看的时候会以为「字变小了」。取景框钉死，键盘只影响下方控件。
+            .ignoresSafeArea(.keyboard, edges: .bottom)
 
             VStack(spacing: 0) {
                 topBar
