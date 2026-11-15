@@ -15,9 +15,13 @@ struct AISettingsView: View {
     @State private var testResult: String?
     @State private var testOK = false
 
+    /// 拍摄时长：和主界面的 @AppStorage 是同一个键，改完立刻生效
+    @AppStorage("dtc.captureSeconds") private var captureSeconds: Double = 3.0
+
     var body: some View {
         NavigationStack {
             Form {
+                captureSection
                 backendSection
                 detectSection
                 effectiveSection
@@ -32,6 +36,38 @@ struct AISettingsView: View {
                     Button("完成") { dismiss() }
                 }
             }
+        }
+    }
+
+    // MARK: 拍摄
+
+    /// 时长决定抖音把成片归到哪一类：越短越像「动图」，越长越容易被当成普通视频/图文。
+    /// 所以摆在这里，随时可改，不用重新装包。
+    private var captureSection: some View {
+        Section {
+            Picker("拍摄时长", selection: $captureSeconds) {
+                Text("3 秒").tag(3.0)
+                Text("4 秒").tag(4.0)
+                Text("5 秒").tag(5.0)
+            }
+            .pickerStyle(.segmented)
+
+            Text(captureHint)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        } header: {
+            Text("拍摄")
+        }
+    }
+
+    private var captureHint: String {
+        switch captureSeconds {
+        case ..<3.5:
+            return "3 秒最接近抖音原生的「动图」，最容易被识别成带角标的视频。"
+        case ..<4.5:
+            return "4 秒在剪映推荐的实况长度（≤3.9 秒）附近，兼容性有保障。"
+        default:
+            return "5 秒能发，但时长越长，抖音越容易当成普通视频或图文。"
         }
     }
 
