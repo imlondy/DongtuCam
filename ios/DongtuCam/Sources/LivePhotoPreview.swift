@@ -2,6 +2,7 @@ import SwiftUI
 import Photos
 import PhotosUI
 import UIKit
+import AVFoundation
 
 /// 一拍的结果。
 ///
@@ -129,6 +130,9 @@ struct LivePhotoPreviewSheet: View {
     @State private var status = "载入动图…"
     @State private var albumUnavailable = false
     @State private var motionState: MotionSaveState = .idle
+    /// 这段视频的真实形态（时长 / 有无音轨 / 分辨率）。
+    /// 抖音按体裁分流的依据就是这几个数，发之前先看见，省得发完再猜。
+    @State private var videoInfo: String?
 
     private enum MotionSaveState: Equatable {
         case idle
@@ -194,6 +198,12 @@ struct LivePhotoPreviewSheet: View {
                             .padding(.horizontal, 30)
                     }
 
+                    if let videoInfo {
+                        Text(videoInfo)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.white.opacity(0.5))
+                    }
+
                     HStack(spacing: 10) {
                         Button(action: openAlbum) {
                             Label("相册", systemImage: "photo.on.rectangle.angled")
@@ -234,7 +244,7 @@ struct LivePhotoPreviewSheet: View {
                     }
 
                     if case .done = motionState {
-                        Text("已存进相册的「视频」分类 · 抖音从「+ → 相册 → 视频」选它，就是带动图角标的视频，不会变成图文")
+                        Text("已存进相册「视频」分类（相册里最新那条）。发抖音请走「+ → 相册 → 视频」选它——不要走「动图」入口，那条是图文通道，实况进去只会变成图文。")
                             .font(.caption2)
                             .foregroundStyle(.white.opacity(0.6))
                             .multilineTextAlignment(.center)
@@ -259,6 +269,25 @@ struct LivePhotoPreviewSheet: View {
             }
         }
         .onAppear(perform: load)
+        .task(id: shot.id) { loadVideoInfo() }
+    }
+
+    /// 读这段动图的真实参数。只读元数据，不解码画面。
+    private func loadVideoInfo() {
+        guard let url = shot.videoURL else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let asset = AVAsset(url: url)
+            let seconds = asset.duration.seconds
+            guard seconds.isFinite, seconds > 0 else { return }
+            let track = asset.tracks(withMediaType: .video).first
+            let size = track?.naturalSize ?? .zero
+            let fps = track.map { Int(($0.nominalFrameRate).rounded()) } ?? 0
+            let hasAudio = !asset.tracks(withMediaType: .audio).isEmpty
+            let text = String(format: "%.1f 秒", seconds)
+                + " · " + (hasAudio ? "带音轨" : "无音轨")
+                + String(format: " · %.0f×%.0f · %d fps", size.width, size.height, fps)
+            DispatchQueue.main.async { videoInfo = text }
+        }
     }
 
     /// 从相册回读刚存的那张实况。
