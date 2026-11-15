@@ -13,6 +13,9 @@ struct ShotResult: Identifiable {
     let localIdentifier: String?
     /// true = 系统已确认是实况；false = 只存成普通照片；nil = 没权限回读
     let isLive: Bool?
+    /// 这一拍的静音动图（已压字、已转正）。缓存区里的副本，
+    /// 拿去存成普通视频 —— 抖音的「动图」是视频体裁，走这条路才有进度条。
+    let videoURL: URL?
     let createdAt = Date()
 
     /// 成片画幅（宽/高）。缩略图是带方向变换解码出来的，尺寸就是显示尺寸，
@@ -125,6 +128,14 @@ struct LivePhotoPreviewSheet: View {
     @State private var livePhoto: PHLivePhoto?
     @State private var status = "载入动图…"
     @State private var albumUnavailable = false
+    @State private var motionState: MotionSaveState = .idle
+
+    private enum MotionSaveState: Equatable {
+        case idle
+        case saving
+        case done
+        case failed(String)
+    }
 
     /// 成片比例，预览、缩略图、播放器三处共用同一个值
     private var aspect: CGFloat { ShotResult.previewAspect(shot.thumbnail) }
@@ -182,14 +193,60 @@ struct LivePhotoPreviewSheet: View {
                             .multilineTextAlignment(.center)
                             .padding(.horizontal, 30)
                     }
-                    Button(action: openAlbum) {
-                        Label("在相册中打开", systemImage: "photo.on.rectangle.angled")
-                            .font(.subheadline.weight(.semibold))
-                            .padding(.horizontal, 20)
-                            .padding(.vertical, 12)
-                            .background(.white, in: Capsule())
-                            .foregroundStyle(.black)
+
+                    HStack(spacing: 10) {
+                        Button(action: openAlbum) {
+                            Label("相册", systemImage: "photo.on.rectangle.angled")
+                                .font(.subheadline.weight(.semibold))
+                                .padding(.horizontal, 18)
+                                .padding(.vertical, 12)
+                                .background(.white, in: Capsule())
+                                .foregroundStyle(.black)
+                        }
+
+                        // 抖音的「动图」是视频体裁（有进度条 + 动图角标），
+                        // 相册里那张实况发出去只会是图文 —— 需要额外一条纯视频。
+                        if shot.videoURL != nil {
+                            Button(action: saveMotionVideo) {
+                                Group {
+                                    switch motionState {
+                                    case .saving:
+                                        HStack(spacing: 7) {
+                                            ProgressView().tint(.white).scaleEffect(0.8)
+                                            Text("存视频…")
+                                        }
+                                    case .done:
+                                        Label("已存视频", systemImage: "checkmark.circle.fill")
+                                    case .failed:
+                                        Label("重试存视频", systemImage: "arrow.clockwise")
+                                    case .idle:
+                                        Label("存成动图视频", systemImage: "film")
+                                    }
+                                }
+                                .font(.subheadline.weight(.semibold))
+                                .padding(.horizontal, 18)
+                                .padding(.vertical, 12)
+                                .background(.white.opacity(0.18), in: Capsule())
+                                .foregroundStyle(.white)
+                            }
+                            .disabled(motionState == .saving || motionState == .done)
+                        }
                     }
+
+                    if case .done = motionState {
+                        Text("已存进相册的「视频」分类 · 抖音从「+ → 相册 → 视频」选它，就是带动图角标的视频，不会变成图文")
+                            .font(.caption2)
+                            .foregroundStyle(.white.opacity(0.6))
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 26)
+                    } else if case .failed(let reason) = motionState {
+                        Text(reason)
+                            .font(.caption2)
+                            .foregroundStyle(.orange.opacity(0.85))
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 26)
+                    }
+
                     if albumUnavailable {
                         Text("系统没有开放跳转相册的入口，请手动打开「照片」App")
                             .font(.caption2)
@@ -240,6 +297,28 @@ struct LivePhotoPreviewSheet: View {
         UIApplication.shared.open(url, options: [:]) { ok in
             DispatchQueue.main.async {
                 if !ok { albumUnavailable = true }
+            }
+        }
+    }
+
+    /// 把这拍的静音动图另存成相册里的普通视频。
+    ///
+    /// 抖音里「实况照片」和「动图」是两条产线：
+    /// - 实况 → 图文（图片体裁），封面会动但没有进度条；
+    /// - 短视频（≈3 秒、无音轨）→ 视频体裁，播放器打「动图」标、有进度条。
+    /// 同一份画面，用户想发哪个形态就取哪个。
+    private func saveMotionVideo() {
+        guard let url = shot.videoURL, motionState != .saving else { return }
+        motionState = .saving
+        Diagnostics.mark("motion.save-begin")
+        LivePhotoWriter.saveVideo(url) { result in
+            switch result {
+            case .success:
+                Diagnostics.mark("motion.save-ok")
+                motionState = .done
+            case .failure(let error):
+                Diagnostics.mark("motion.save-failed")
+                motionState = .failed(error.localizedDescription)
             }
         }
     }
