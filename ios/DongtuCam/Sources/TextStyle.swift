@@ -148,11 +148,14 @@ final class TextStyleStore: ObservableObject {
     @Published var style: TextStyle {
         didSet {
             guard style != oldValue else { return }
-            save()
+            scheduleSave()
         }
     }
 
     private static let storageKey = "dtc.textStyle.v1"
+    /// 拖动/捏合时每秒会产生几十次变更，没必要每次都写盘。
+    /// 合并成「停手 0.35 秒后写一次」，手感更稳，也不会有写丢的风险。
+    private var saveWork: DispatchWorkItem?
 
     init() {
         style = Self.load()
@@ -171,9 +174,16 @@ final class TextStyleStore: ObservableObject {
         return decoded
     }
 
-    private func save() {
-        guard let data = try? JSONEncoder().encode(style) else { return }
-        UserDefaults.standard.set(data, forKey: Self.storageKey)
+    private func scheduleSave() {
+        saveWork?.cancel()
+        // 捕捉当前值，不依赖执行时的 self.style（那时可能又变了）
+        let snapshot = style
+        let work = DispatchWorkItem {
+            guard let data = try? JSONEncoder().encode(snapshot) else { return }
+            UserDefaults.standard.set(data, forKey: Self.storageKey)
+        }
+        saveWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 }
 
