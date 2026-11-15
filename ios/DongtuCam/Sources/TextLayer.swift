@@ -2,62 +2,63 @@ import UIKit
 import CoreGraphics
 import CoreText
 
-/// 文案渲染。**同一套排版**同时供静帧（HEIC）和逐帧视频（动图）使用。
+/// 文案渲染。**预览、封面（HEIC）、逐帧视频（动图）共用这一套排版与绘制**。
 ///
-/// ## v22：为什么文字终于能清晰
+/// ## v25：排版参数从「拍脑袋换算」改成「样式驱动」
 ///
-/// v14~v21 一直用「一次 NSAttributedString.draw + `.strokeWidth` 负值 + NSShadow」。
-/// 这在真机上必然发糊，原因有三条，都是叠加的：
+/// v22~v24 的字号是按「预览 13pt + 2 → 按屏宽换算成像素」推出来的，
+/// 位置写死在画面上部居中。那样只能保证「差不多」，一旦要改字体、改位置就无从下手，
+/// 而且预览是 SwiftUI 画、成片是 TextLayer 画，两套代码天然对不上。
 ///
-/// 1. **`.strokeWidth` 负值 = 填充 + 居中描边**。描边线宽的一半会吃掉笔画内部的白色，
-///    中文字粗体笔画本身只有字号的 8~10%，描边一宽，字就变成「空心黑框 + 细白芯」，
-///    视觉上就是发灰、发糊。截图里那种「字有网格、笔画中间发虚」正是它。
-/// 2. **NSShadow 会强制走离屏合成路径**。哪怕 blur 半径设成 0，只要 `.shadow`
-///    属性存在，CoreText 就会先把整行渲染到一张临时 bitmap 再合成，
-///    这张 bitmap 的栅格化尺寸不等同于目标画布，边缘必然被重采样一遍。
-/// 3. **文字与底图不在同一个绘制事务里**。静帧是「先渲染透明图层 → 再 UIGraphics
-///    把图层缩放到画布 → 编码」，中间那次缩放就是在拿位图做重采样。
+/// 现在排版只由 `TextStyle` 决定：
+///   - 字号 = `sizeRatio × 画布宽度`；
+///   - 位置 = 归一化中心点；
+///   - 字体 = `TextFont`。
 ///
-/// v22 的做法：
-/// - **两遍绘制**：先画「只描边」（`.strokeWidth` 正值），再画「只填充」。
-///   填充把笔画内部完全盖成实心白，描边只留下外侧那一圈 —— 这是唯一能得到
-///   「实心白字 + 干净黑轮廓」的画法，也是抖音/剪映字幕的实现方式。
-/// - **没有 NSShadow**：分离度靠描边，不靠阴影。
-/// - **一步到最终像素**：`layout(size:)` 直接按目标画布的像素尺寸算字号与行位，
-///   静帧和视频帧各自在自己的分辨率上做一次矢量光栅化，**中间没有任何位图缩放**。
+/// 预览只是把「画布」换成屏幕上的矩形去调同一个 `layout(...)`，
+/// 所以**字体、字号、行距、描边、位置全部一致**，这就是所见即所得。
+///
+/// ## v22 留下的画法（不要再改回去）
+///
+/// v14~v21 用「一次 NSAttributedString.draw + `.strokeWidth` 负值 + NSShadow」，
+/// 真机上必然发糊：
+/// 1. **负值 strokeWidth = 填充 + 居中描边**，描边有一半画进笔画内部。
+///    中文粗体笔画只有字号的 8~10%，描边一宽就变成「空心黑框 + 细白芯」。
+/// 2. **NSShadow 强制走离屏合成**，哪怕 blur=0 也会先渲染到临时 bitmap 再合成，
+///    边缘必被重采样一次。
+///
+/// 现在的画法是**两遍绘制**（抖音/剪映字幕的做法）：
+/// 先画「只描边」（正值 strokeWidth），再画「只填充」；填充把描边内圈盖掉，
+/// 视觉上只剩外侧一圈干净轮廓，笔画内部永远是实心白。
 enum TextLayer {
 
-    /// 单次渲染的最大行数（再多会把字号压到看不清）
+    /// 单次渲染的最大行数（再多字号会小到看不清）
     private static let maxLines = 5
     /// 外描边宽度（百分比，相对字号）。正值 strokeWidth 的语义是「只描边、不填充」，
     /// 线宽 = 字号 × strokePercent / 100，**居中**画在字形轮廓上；
-    /// 第二遍填充会把内侧那一半完全盖掉，所以最终可见的只是外侧 `strokePercent/2`。
-    /// 9% 在 62px 字号下 → 外轮廓约 2.8px，是短视频字幕那种「利落黑边」的粗细，
-    /// 字与背景任何颜色下都能分开，又不至于把白字挤细。
-    /// 关键安全点：描边只出现在**字形外部**，笔画内部的白色永远是完整的 ——
-    /// 这正是 v14~v21「负 strokeWidth 居中吃掉笔画」做不到的。
+    /// 第二遍填充会把内侧一半盖掉，所以最终可见的只是外侧 `strokePercent/2`。
+    /// 9% 在 90px 字号下 → 外轮廓约 4px，是短视频字幕那种「利落黑边」的粗细。
     private static let strokePercent: CGFloat = 9.0
-    private static let lineSpacing: CGFloat = 1.26
 
     // MARK: - 排版结果
 
-    /// 排好的版：每行的纯文本富文本 + 绘制起点（UIKit 坐标，原点左上）
+    /// 排好的版：每行的富文本 + 绘制起点（UIKit 坐标，原点左上）
     struct Layout {
-        let size: CGSize
+        let canvas: CGSize
         let fontSize: CGFloat
+        /// 文字块外接矩形（含描边余量）。预览只渲染这一块，不必重画整屏。
+        let blockRect: CGRect
         let lines: [NSAttributedString]
         let origins: [CGPoint]
     }
 
     // MARK: - 对外入口
 
-    /// 生成静帧用的透明文字层。尺寸必须与静帧画布**完全一致**。
-    static func make(lines: [String], size: CGSize,
-                     previewFontPt: CGFloat = 13,
-                     screenWidthPt: CGFloat = 393) -> CGImage? {
-        guard let prepared = layout(lines: lines, size: size,
-                                    previewFontPt: previewFontPt,
-                                    screenWidthPt: screenWidthPt) else { return nil }
+    /// 生成整张画布的透明文字层，供静帧合成用。尺寸必须与静帧画布完全一致。
+    static func make(lines: [String], style: TextStyle, canvas: CGSize,
+                     maxWidthRatio: CGFloat = 0.92) -> CGImage? {
+        guard let layout = layout(lines: lines, style: style, canvas: canvas,
+                                  maxWidthRatio: maxWidthRatio) else { return nil }
 
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
@@ -65,73 +66,108 @@ enum TextLayer {
         // 固定 sRGB：广色域会让白字发灰
         format.preferredRange = .standard
 
-        return UIGraphicsImageRenderer(size: size, format: format).image { ctx in
-            draw(prepared, in: ctx.cgContext)
+        return UIGraphicsImageRenderer(size: canvas, format: format).image { ctx in
+            draw(layout, in: ctx.cgContext)
         }.cgImage
     }
 
-    /// 按目标尺寸算好版式。视频逐帧合成时也用它 —— 视频帧和静帧用同一套比例，
-    /// 所以动图播放时文字的位置、大小与封面完全一致，不会「跳」。
-    static func layout(lines raw: [String], size: CGSize,
-                       previewFontPt: CGFloat = 13,
-                       screenWidthPt: CGFloat = 393) -> Layout? {
+    /// 只渲染文字块本身（预览用）。
+    ///
+    /// 预览每敲一个字都要重画，整屏渲染太浪费；只画文字块既快，
+    /// 又把「绘制逻辑只有一份」这件事保住了 —— 见 `TextBlockImage`。
+    ///
+    /// - Returns: 图像内容就是 `rect` 那一块画布，位置由调用方摆放。
+    static func renderBlock(lines: [String], style: TextStyle, canvas: CGSize,
+                            scale: CGFloat,
+                            maxWidthRatio: CGFloat = 0.92) -> (image: CGImage, rect: CGRect)? {
+        guard let layout = layout(lines: lines, style: style, canvas: canvas,
+                                  maxWidthRatio: maxWidthRatio),
+              layout.blockRect.width > 1, layout.blockRect.height > 1 else { return nil }
+
+        let rect = layout.blockRect
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = max(1, scale)
+        format.opaque = false
+        format.preferredRange = .standard
+
+        let image = UIGraphicsImageRenderer(size: rect.size, format: format).image { ctx in
+            // 坐标系搬过去：让线条的位标继续用画布坐标，绘制代码无需知道自己在被裁着画
+            ctx.cgContext.translateBy(x: -rect.minX, y: -rect.minY)
+            draw(layout, in: ctx.cgContext)
+        }
+        return (image.cgImage, rect)
+    }
+
+    /// 按样式算出排版。预览与成片走的是同一条路，只是 `canvas` 不同。
+    ///
+    /// - Parameter maxWidthRatio: 文字块可用宽度占画布的比例。
+    ///   相机预览是 aspectFill 铺满全屏，画面两边会被裁掉；若按整个画面宽度排版，
+    ///   长句子在预览里就被切了。传「屏幕上实际看得见的宽度比例」进来，
+    ///   预览和成片用同一个值，两边都不外溢 —— 这也是所见即所得的一部分。
+    static func layout(lines raw: [String], style: TextStyle, canvas: CGSize,
+                       maxWidthRatio: CGFloat = 0.92) -> Layout? {
         let cleaned = raw
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .prefix(maxLines)
             .map { String($0) }
-        guard size.width >= 2, size.height >= 2, !cleaned.isEmpty else { return nil }
+        guard canvas.width >= 2, canvas.height >= 2, !cleaned.isEmpty else { return nil }
 
-        let w = size.width
-        let h = size.height
+        let w = canvas.width
+        let h = canvas.height
+        let textFont = style.font
+        let maxWidth = w * min(1, max(0.3, maxWidthRatio))
+        let maxHeight = h * 0.70
+        let lowerBound = w * TextStyle.minSizeRatio
 
-        // pt → 成片像素：同一条屏宽上，画面像素数 / 屏幕磅数
-        let pxPerPt = w / max(1, screenWidthPt)
-        let target = (previewFontPt + 2) * pxPerPt
-
-        let maxWidth = w * 0.90
-        let maxBlockHeight = h * 0.42
-        // 兜底上下限：再小看不清，再大就会盖住商品
-        let upperBound = min(target, w * 0.085)
-        let lowerBound = max(16, w * 0.036)
-
-        var fontSize = upperBound
-        var lineHeight = fontSize * lineSpacing
-        while fontSize > lowerBound {
-            lineHeight = fontSize * lineSpacing
-            let widest = cleaned.map { measure($0, fontSize: fontSize) }.max() ?? 0
-            if widest <= maxWidth && lineHeight * CGFloat(cleaned.count) <= maxBlockHeight {
+        // 用户设的字号优先；只有真的放不下（长句 / 行数多）才按比例缩，直到装得下。
+        // 这条规则与画布尺寸无关，所以预览缩到什么程度，成片就缩到什么程度。
+        var fontSize = max(lowerBound, style.sizeRatio * w)
+        for _ in 0..<60 {
+            let font = textFont.uiFont(size: fontSize)
+            let widest = cleaned.map { attributed($0, font: font, fontSize: fontSize).size().width }
+                .max() ?? 0
+            if widest <= maxWidth && fontSize * style.lineSpacing * CGFloat(cleaned.count) <= maxHeight {
                 break
             }
-            fontSize -= max(1, fontSize * 0.03)
+            guard fontSize > lowerBound else { break }
+            fontSize = max(lowerBound, fontSize * 0.95)
         }
-        fontSize = max(fontSize, lowerBound).rounded()
-        lineHeight = (fontSize * lineSpacing).rounded()
 
-        let top = max(8, h * 0.055)
+        let lineHeight = fontSize * style.lineSpacing
         let blockHeight = lineHeight * CGFloat(cleaned.count)
-        // 行数多时整体略微上移，保证视觉重心仍在画面上部
-        let startY = top + max(0, (maxBlockHeight - blockHeight) * 0.18)
+        let blockTop = style.centerY * h - blockHeight / 2
+        let font = textFont.uiFont(size: fontSize)
 
         var lines: [NSAttributedString] = []
         var origins: [CGPoint] = []
         for (index, line) in cleaned.enumerated() {
-            let text = attributed(line, fontSize: fontSize)
-            let textSize = text.size()
-            // 坐标取整：落在半个像素上会让 CoreGraphics 做重采样，白字边缘就毛了
-            let x = ((w - textSize.width) / 2).rounded()
-            let slotY = startY + CGFloat(index) * lineHeight
-            let y = (slotY + max(0, (lineHeight - textSize.height) / 2)).rounded()
+            let text = attributed(line, font: font, fontSize: fontSize)
+            let size = text.size()
+            let x = style.centerX * w - size.width / 2
+            // 行盒内垂直居中：不同字体的 ascender/descender 不一样，
+            // 不居中的话换字体后整块会往上/往下跳
+            let y = blockTop + CGFloat(index) * lineHeight + max(0, (lineHeight - size.height) / 2)
             lines.append(text)
             origins.append(CGPoint(x: x, y: y))
         }
-        return Layout(size: size, fontSize: fontSize, lines: lines, origins: origins)
+
+        var union = CGRect.null
+        for (index, text) in lines.enumerated() {
+            union = union.union(CGRect(origin: origins[index], size: text.size()))
+        }
+        // 描边会溢出字形外框，外扩一点免得预览把黑边裁掉
+        let padding = fontSize * 0.14 + 2
+        let blockRect = union.insetBy(dx: -padding, dy: -padding)
+
+        return Layout(canvas: canvas, fontSize: fontSize, blockRect: blockRect,
+                      lines: lines, origins: origins)
     }
 
     /// 把排好的版画进任意 CGContext（UIKit 坐标系，原点左上）。
     ///
-    /// 调用方负责已经翻转好 CTM（静帧走 UIGraphicsImageRenderer 自动翻好；
-    /// 逐帧合成里由 FrameBurner 手动翻转）。这里只做「描边一遍 + 填充一遍」。
+    /// 调用方负责已经把 CTM 翻好（静帧走 UIGraphicsImageRenderer 自动翻；
+    /// 逐帧合成里由 FrameBurner 手动翻）。这里只做「描边一遍 + 填充一遍」。
     static func draw(_ layout: Layout, in context: CGContext) {
         UIGraphicsPushContext(context)
         defer { UIGraphicsPopContext() }
@@ -159,17 +195,12 @@ enum TextLayer {
 
     // MARK: - 行内解析：引号内琥珀高亮、行尾 !! 自绘双叹号
 
-    private static func measure(_ line: String, fontSize: CGFloat) -> CGFloat {
-        attributed(line, fontSize: fontSize).size().width
-    }
-
     /// 只带 `font` 与 `foregroundColor`。描边与阴影一律由 `draw` 统一加，
     /// 属性分散在两层时（v14~v21 就是这样）很容易互相覆盖，是文字发糊的来源之一。
-    private static func attributed(_ raw: String, fontSize: CGFloat) -> NSAttributedString {
+    private static func attributed(_ raw: String, font: UIFont,
+                                   fontSize: CGFloat) -> NSAttributedString {
         let warmWhite = UIColor(red: 1.0, green: 0.992, blue: 0.976, alpha: 1.0)
         let amber = UIColor(red: 1.0, green: 0.784, blue: 0.310, alpha: 1.0)
-
-        let font = UIFont.systemFont(ofSize: fontSize, weight: .bold)
 
         func attributes(_ color: UIColor) -> [NSAttributedString.Key: Any] {
             [.font: font, .foregroundColor: color]
