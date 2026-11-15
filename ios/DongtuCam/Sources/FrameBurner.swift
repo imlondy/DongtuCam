@@ -32,8 +32,11 @@ enum FrameBurner {
     struct Config {
         let source: URL
         let lines: [String]
-        let previewFontPt: CGFloat
-        let screenWidthPt: CGFloat
+        /// 排版全部由样式决定：预览、封面、这段视频三者用同一个 `TextStyle`，
+        /// 所以动图播放时文字的位置/大小/字体与封面、与拍前预览完全一致
+        let style: TextStyle
+        /// 文字可用宽度占比（与预览同一个值，保证换行位置也一样）
+        let maxWidthRatio: CGFloat
         let identifier: String
     }
 
@@ -172,12 +175,12 @@ enum FrameBurner {
             throw BurnEngineError.writerFailed("拿不到像素缓冲池")
         }
 
-        // 与静帧同一套排版：字号按画布宽度换算，位置按高度比例，
+        // 与静帧同一套排版：字号按画布宽度比例、位置按归一化坐标，
         // 所以动图播放时文字和封面完全对齐，不会跳
         let canvas = CGSize(width: outW, height: outH)
-        let layout = TextLayer.layout(lines: config.lines, size: canvas,
-                                      previewFontPt: config.previewFontPt,
-                                      screenWidthPt: config.screenWidthPt)
+        let layout = TextLayer.layout(lines: config.lines, style: config.style,
+                                      canvas: canvas,
+                                      maxWidthRatio: config.maxWidthRatio)
         Diagnostics.mark(layout == nil ? "burnV.nolayout" : "burnV.layout-\(Int(layout!.fontSize))")
 
         var frames = 0
