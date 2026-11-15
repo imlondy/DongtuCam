@@ -236,6 +236,13 @@ enum BurnEngine {
             if !duration.isNumeric || duration.seconds <= 0 {
                 duration = CMTime(seconds: 5, preferredTimescale: 600)
             }
+            // 直通路径也要卡 3 秒以内（抖音「超过 3 秒的动图只发成静态图」），
+            // 这是压字失败时的降级路线，同样得合规
+            let capTime = CMTime(seconds: 2.9, preferredTimescale: 600)
+            if duration > capTime {
+                duration = capTime
+                Diagnostics.mark("burn.remux-trim")
+            }
 
             do {
                 let reader = try AVAssetReader(asset: asset)
@@ -310,8 +317,21 @@ enum BurnEngine {
                 videoInput.requestMediaDataWhenReady(on: DispatchQueue(label: "dtc.remux.video")) {
                     if videoDone { return }
                     while videoInput.isReadyForMoreMediaData {
-                        guard let sample = videoOut.copyNextSampleBuffer(),
-                              videoInput.append(sample) else {
+                        guard let sample = videoOut.copyNextSampleBuffer() else {
+                            videoDone = true
+                            videoInput.markAsFinished()
+                            group.leave()
+                            return
+                        }
+                        // 超过上限的帧直接丢掉，而不是靠外部 cut —— 这里已经有现成的
+                        // sample 循环，多一次时间判断比再套一层 exporter 稳
+                        if CMSampleBufferGetPresentationTimeStamp(sample) >= capTime {
+                            videoDone = true
+                            videoInput.markAsFinished()
+                            group.leave()
+                            return
+                        }
+                        guard videoInput.append(sample) else {
                             videoDone = true
                             videoInput.markAsFinished()
                             group.leave()
