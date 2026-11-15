@@ -46,8 +46,15 @@ enum TextLayer {
     struct Layout {
         let canvas: CGSize
         let fontSize: CGFloat
-        /// 文字块外接矩形（含描边余量）。预览只渲染这一块，不必重画整屏。
+        /// 文字块外接矩形（含描边与底色余量）。预览只渲染这一块，不必重画整屏。
         let blockRect: CGRect
+        /// 底色块（无底色时为 nil）
+        let backgroundRect: CGRect?
+        let background: UIColor?
+        /// 底色圆角
+        let cornerRadius: CGFloat
+        /// 描边色（无描边时为 nil）
+        let outline: UIColor?
         let lines: [NSAttributedString]
         let origins: [CGPoint]
     }
@@ -120,14 +127,17 @@ enum TextLayer {
         let maxWidth = w * min(1, max(0.3, maxWidthRatio))
         let maxHeight = h * 0.70
         let lowerBound = w * TextStyle.minSizeRatio
+        let palette = style.palette
 
         // 用户设的字号优先；只有真的放不下（长句 / 行数多）才按比例缩，直到装得下。
         // 这条规则与画布尺寸无关，所以预览缩到什么程度，成片就缩到什么程度。
         var fontSize = max(lowerBound, style.sizeRatio * w)
         for _ in 0..<60 {
             let font = textFont.uiFont(size: fontSize)
-            let widest = cleaned.map { attributed($0, font: font, fontSize: fontSize).size().width }
-                .max() ?? 0
+            let widest = cleaned.map {
+                attributed($0, font: font, fontSize: fontSize,
+                           base: palette.color, accent: palette.accent).size().width
+            }.max() ?? 0
             if widest <= maxWidth && fontSize * style.lineSpacing * CGFloat(cleaned.count) <= maxHeight {
                 break
             }
@@ -143,7 +153,8 @@ enum TextLayer {
         var lines: [NSAttributedString] = []
         var origins: [CGPoint] = []
         for (index, line) in cleaned.enumerated() {
-            let text = attributed(line, font: font, fontSize: fontSize)
+            let text = attributed(line, font: font, fontSize: fontSize,
+                                  base: palette.color, accent: palette.accent)
             let size = text.size()
             let x = style.centerX * w - size.width / 2
             // 行盒内垂直居中：不同字体的 ascender/descender 不一样，
@@ -159,37 +170,59 @@ enum TextLayer {
         }
         // 描边会溢出字形外框，外扩一点免得预览把黑边裁掉
         let padding = fontSize * 0.14 + 2
-        let blockRect = union.insetBy(dx: -padding, dy: -padding)
+        var blockRect = union.insetBy(dx: -padding, dy: -padding)
+
+        // 底色块：上下留白比左右略小，读起来像「字幕条」而不是方块
+        var backgroundRect: CGRect?
+        if style.background.color != nil {
+            let bgRect = union.insetBy(dx: -fontSize * 0.30, dy: -fontSize * 0.17)
+            backgroundRect = bgRect
+            blockRect = blockRect.union(bgRect.insetBy(dx: -padding, dy: -padding))
+        }
 
         return Layout(canvas: canvas, fontSize: fontSize, blockRect: blockRect,
+                      backgroundRect: backgroundRect,
+                      background: style.background.color?.withAlphaComponent(min(1, max(0.05, style.bgOpacity))),
+                      cornerRadius: fontSize * 0.34,
+                      outline: style.outline.color,
                       lines: lines, origins: origins)
     }
 
     /// 把排好的版画进任意 CGContext（UIKit 坐标系，原点左上）。
     ///
     /// 调用方负责已经把 CTM 翻好（静帧走 UIGraphicsImageRenderer 自动翻；
-    /// 逐帧合成里由 FrameBurner 手动翻）。这里只做「描边一遍 + 填充一遍」。
+    /// 逐帧合成里由 FrameBurner 手动翻）。这里依次做：
+    /// 底色块 → 描边一遍 → 填充一遍。
     static func draw(_ layout: Layout, in context: CGContext) {
         UIGraphicsPushContext(context)
         defer { UIGraphicsPopContext() }
 
-        // 深褐近黑，比纯黑更贴视频常见的暖色调背景
-        let outline = UIColor(red: 0.09, green: 0.055, blue: 0.045, alpha: 1.0)
+        // 1) 底色（如果有）：先铺块，字压在上面
+        if let rect = layout.backgroundRect, let color = layout.background {
+            context.setFillColor(color.cgColor)
+            let path = UIBezierPath(roundedRect: rect, cornerRadius: layout.cornerRadius)
+            context.addPath(path.cgPath)
+            context.fillPath()
+        }
+
+        let outline = layout.outline
 
         for (index, text) in layout.lines.enumerated() where index < layout.origins.count {
             let point = layout.origins[index]
 
-            // 第一遍：只描边（正值 strokeWidth = 不填充）
-            let stroked = NSMutableAttributedString(attributedString: text)
-            let full = NSRange(location: 0, length: stroked.length)
-            stroked.addAttributes([
-                .strokeColor: outline,
-                .strokeWidth: strokePercent,
-                .foregroundColor: UIColor.clear
-            ], range: full)
-            stroked.draw(at: point)
+            // 2) 第一遍：只描边（正值 strokeWidth = 不填充）
+            if let outline {
+                let stroked = NSMutableAttributedString(attributedString: text)
+                let full = NSRange(location: 0, length: stroked.length)
+                stroked.addAttributes([
+                    .strokeColor: outline,
+                    .strokeWidth: strokePercent,
+                    .foregroundColor: UIColor.clear
+                ], range: full)
+                stroked.draw(at: point)
+            }
 
-            // 第二遍：只填充。盖住描边内圈 → 视觉上只剩外侧一圈轮廓，笔画内部是实心白
+            // 3) 第二遍：只填充。盖住描边内圈 → 视觉上只剩外侧一圈轮廓，笔画内部是实心色
             text.draw(at: point)
         }
     }
@@ -198,12 +231,16 @@ enum TextLayer {
 
     /// 只带 `font` 与 `foregroundColor`。描边与阴影一律由 `draw` 统一加，
     /// 属性分散在两层时（v14~v21 就是这样）很容易互相覆盖，是文字发糊的来源之一。
+    ///
+    /// - Parameters:
+    ///   - base: 正文颜色（来自 `TextPalette.color`）
+    ///   - accent: 引号内卖点与行尾双叹号的颜色（来自 `TextPalette.accent`）
     private static func attributed(_ raw: String, font: UIFont,
-                                   fontSize: CGFloat) -> NSAttributedString {
-        let warmWhite = UIColor(red: 1.0, green: 0.992, blue: 0.976, alpha: 1.0)
-        let amber = UIColor(red: 1.0, green: 0.784, blue: 0.310, alpha: 1.0)
-
+                                   fontSize: CGFloat,
+                                   base: UIColor, accent: UIColor) -> NSAttributedString {
         func attributes(_ color: UIColor) -> [NSAttributedString.Key: Any] {
+            // 表情是彩色位图字形，foregroundColor 对它无效，但也不会被染色 ——
+            // 所以文字换色后 emoji 依然是原生彩色，这是想要的效果。
             [.font: font, .foregroundColor: color]
         }
 
@@ -224,17 +261,17 @@ enum TextLayer {
 
         for ch in text {
             if quotes.contains(ch) {
-                flush(inQuote ? amber : warmWhite)
-                out.append(NSAttributedString(string: String(ch), attributes: attributes(warmWhite)))
+                flush(inQuote ? accent : base)
+                out.append(NSAttributedString(string: String(ch), attributes: attributes(base)))
                 inQuote.toggle()
             } else {
                 buffer.append(ch)
             }
         }
-        flush(inQuote ? amber : warmWhite)
+        flush(inQuote ? accent : base)
 
         if hasMark {
-            out.append(markImage(fontSize: fontSize, color: amber))
+            out.append(markImage(fontSize: fontSize, color: accent))
         }
         return out
     }
