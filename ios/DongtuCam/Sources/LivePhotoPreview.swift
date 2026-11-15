@@ -466,10 +466,9 @@ private struct ActivitySheet: UIViewControllerRepresentable {
         // 剩下的基本就是抖音、微信、隔空投送，抖音更容易在首屏出现。
         controller.excludedActivityTypes = [
             .addToReadingList, .assignToContact, .copyToPasteboard, .mail,
-            .markupAsPDF, .message, .openInWhatsApp, .postToFacebook,
+            .markupAsPDF, .message, .postToFacebook,
             .postToFlickr, .postToTencentWeibo, .postToTwitter, .postToVimeo,
-            .postToWeibo, .print, .saveToCameraRoll, .sharePlay,
-            .collaborationInviteWithLink, .collaborationCopyLink
+            .postToWeibo, .print, .saveToCameraRoll, .sharePlay
         ]
         // iPad / 分屏下必须给 popover 一个锚点，否则弹出即崩
         if let popover = controller.popoverPresentationController {
