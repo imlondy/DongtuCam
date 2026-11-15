@@ -204,6 +204,17 @@ struct LivePhotoPreviewSheet: View {
                             .foregroundStyle(.white.opacity(0.5))
                     }
 
+                    // 这是整条链路上最容易走错的一步：入口和那个靶心按钮缺一不可。
+                    // 走「视频」入口发出来一定是普通视频（就算只有 2 秒也没角标）。
+                    VStack(spacing: 3) {
+                        Text("发抖音：+ → 相册 → 动图 → 选这张")
+                        Text("再点编辑页右侧的靶心图标，变成 ∞ 循环后发布")
+                    }
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.yellow.opacity(0.85))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
+
                     HStack(spacing: 10) {
                         Button(action: openAlbum) {
                             Label("相册", systemImage: "photo.on.rectangle.angled")
@@ -230,7 +241,7 @@ struct LivePhotoPreviewSheet: View {
                                     case .failed:
                                         Label("重试存视频", systemImage: "arrow.clockwise")
                                     case .idle:
-                                        Label("存成动图视频", systemImage: "film")
+                                        Label("另存纯视频", systemImage: "film")
                                     }
                                 }
                                 .font(.subheadline.weight(.semibold))
@@ -244,7 +255,7 @@ struct LivePhotoPreviewSheet: View {
                     }
 
                     if case .done = motionState {
-                        Text("已存进相册「视频」分类（相册里最新那条）。发抖音请走「+ → 相册 → 视频」选它——不要走「动图」入口，那条是图文通道，实况进去只会变成图文。")
+                        Text("已存成普通视频（相册「视频」分类）。注意：这条没有动图角标，只在需要纯视频素材时用；要角标还是走上面的「动图」入口。")
                             .font(.caption2)
                             .foregroundStyle(.white.opacity(0.6))
                             .multilineTextAlignment(.center)
