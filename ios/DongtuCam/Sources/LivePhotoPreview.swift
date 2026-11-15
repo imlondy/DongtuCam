@@ -137,7 +137,6 @@ struct LivePhotoPreviewSheet: View {
     @State private var douyinMissing = false
     @State private var motionState: MotionSaveState = .idle
     @State private var showShare = false
-    @State private var preparing = false
     /// 交给系统分享面板的东西。可能是单个 .mov，也可能是 HEIC + MOV 两项
     @State private var shareItems: [Any] = []
     /// 这段视频的真实形态（时长 / 有无音轨 / 分辨率 / 编码 / 实况标记）。
@@ -223,14 +222,16 @@ struct LivePhotoPreviewSheet: View {
                         }
                     }
 
-                    // 抖音发布页左上角那个「动图」标，只出现在它自家 SDK 投稿的素材上：
-                    // 系统分享进来的内容走的是「文件导入」流水线，不带这个标。
-                    // 最后一条低成本路径：把 PHLivePhoto **对象**交给系统分享 ——
-                    // 这是 iOS 里唯一能把「实况照片」成对交付给接收方的方式，
-                    // 系统会以 com.apple.live-photo 类型注册，而不是拆成一张图或一段视频。
+                    // 查证结论（抖音开放平台 iOS 分享文档）：
+                    // ①「分享的过程是通过相册对资源进行跨进程通信」，
+                    //    参数必须是**相册里的 local identifier**，文件路径/对象都不行；
+                    // ②「当资源类型为图片时，默认生成图片视频」。
+                    // 也就是说抖音的「动图」= 它把相册里的图片自动渲染成视频，
+                    // 文件名、时长、实况标记都不参与判定。所以唯一能出角标的路径，
+                    // 就是让抖音自己去相册取那一张 —— 和剪映在 App 内投稿是同一个机制。
                     VStack(spacing: 3) {
-                        Text("点「分享实况给抖音」，看发布页左上角有没有「动图」")
-                        Text("这条再不行，就只剩抖音开放平台 SDK 了")
+                        Text("发布路径（唯一能出「动图」角标）：")
+                        Text("+ → 相册 → 动图 → 选最新这张 → 点右侧靶心变 ∞")
                     }
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.yellow.opacity(0.85))
@@ -238,34 +239,20 @@ struct LivePhotoPreviewSheet: View {
                     .padding(.horizontal, 24)
 
                     HStack(spacing: 10) {
-                        // 有 PHLivePhoto 就交实况对象；没有就退回带标记的原片。
-                        // 之前几版都先转码成 mp4 —— AVAssetExportSession 会连
-                        // content.identifier 和 still-image-time 一起丢掉。
-                        if livePhoto != nil || shot.videoURL != nil {
-                            Button { share(livePhoto != nil ? .livePhotoObject : .liveMovie) } label: {
-                                Group {
-                                    if preparing {
-                                        HStack(spacing: 7) {
-                                            ProgressView().tint(.black).scaleEffect(0.8)
-                                            Text("准备…")
-                                        }
-                                    } else {
-                                        Label("分享实况给抖音", systemImage: "square.and.arrow.up")
-                                    }
-                                }
+                        // 主入口：跳抖音，让它自己去相册取实况。
+                        // 系统分享面板做不到这件事 —— 它只能递文件，
+                        // 而抖音的分享接口只认相册里的 PHAsset 标识。
+                        Button(action: openDouyin) {
+                            Label("打开抖音发布", systemImage: "arrow.up.forward.app")
                                 .font(.subheadline.weight(.semibold))
                                 .padding(.horizontal, 18)
                                 .padding(.vertical, 12)
                                 .background(.white, in: Capsule())
                                 .foregroundStyle(.black)
-                            }
-                            .disabled(preparing)
                         }
 
-                        // 少走几步的捷径：存进相册后直接跳抖音，
-                        // 从「+ → 相册 → 动图」进去发（这条已验证能出角标）
-                        Button(action: openDouyin) {
-                            Label("打开抖音", systemImage: "arrow.up.forward.app")
+                        Button(action: openAlbum) {
+                            Label("相册", systemImage: "photo.on.rectangle.angled")
                                 .font(.subheadline.weight(.semibold))
                                 .padding(.horizontal, 18)
                                 .padding(.vertical, 12)
@@ -274,36 +261,15 @@ struct LivePhotoPreviewSheet: View {
                         }
                     }
 
-                    HStack(spacing: 8) {
-                        Button(action: openAlbum) {
-                            Label("相册", systemImage: "photo.on.rectangle.angled")
+                    // 备选：只想发成普通视频（有进度条、能分享成「视频」，但没有动图角标）
+                    if shot.videoURL != nil {
+                        Button { share(.liveMovie) } label: {
+                            Label("分享成普通视频（无角标）", systemImage: "square.and.arrow.up")
                                 .font(.caption2.weight(.medium))
                                 .padding(.horizontal, 12)
                                 .padding(.vertical, 8)
                                 .background(.white.opacity(0.12), in: Capsule())
                                 .foregroundStyle(.white.opacity(0.9))
-                        }
-
-                        if shot.videoURL != nil {
-                            Button { share(.liveBundle) } label: {
-                                Label("HEIC+MOV", systemImage: "rectangle.stack")
-                                    .font(.caption2.weight(.medium))
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
-                                    .background(.white.opacity(0.12), in: Capsule())
-                                    .foregroundStyle(.white.opacity(0.9))
-                            }
-                            .disabled(preparing || shot.stillURL == nil)
-
-                            Button { share(.compatMP4) } label: {
-                                Label("纯视频 mp4", systemImage: "film")
-                                    .font(.caption2.weight(.medium))
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
-                                    .background(.white.opacity(0.12), in: Capsule())
-                                    .foregroundStyle(.white.opacity(0.9))
-                            }
-                            .disabled(preparing)
                         }
                     }
 
@@ -481,70 +447,26 @@ struct LivePhotoPreviewSheet: View {
         douyinMissing = true
     }
 
-    /// 交给抖音的几种形态。抖音的判定条件没公开，只能让它自己挑。
+    /// 交给抖音的形态。
+    ///
+    /// **为什么没有「实况对象」这一项了**：v35 试过把 `PHLivePhoto` 交给系统分享，
+    /// 抖音弹 `[20002] params error, No Media Resource`。
+    /// 官方文档写得很清楚：抖音的分享「通过**相册**对资源进行跨进程通信」，
+    /// 参数必须是**资源在系统相册的 local identifier**，不是对象、也不是文件 URL。
+    /// 系统分享面板给的是文件，所以这条路在结构上就走不通。
     private enum ShareMode {
-        /// 把 PHLivePhoto **对象**交给系统分享。
-        /// 系统会以 `com.apple.live-photo` 注册到一个 NSItemProvider 上，
-        /// 接收方拿到的是成对的静帧 + 视频，而不是被拆开的某一样。
-        case livePhotoObject
-        /// 带实况标记的原片 .mov：H.264 + content.identifier + still-image-time
+        /// 带实况标记的原片 .mov（视频体裁，无「动图」角标）
         case liveMovie
-        /// HEIC + MOV 两项一起给
-        case liveBundle
-        /// 转码成 mp4 的纯视频（对照用）
-        case compatMP4
     }
 
-    /// 打开系统分享面板，把这一拍的素材交给抖音。
-    ///
-    /// **不能无条件转码**：`AVAssetExportSession` 只搬音视频轨，
-    /// 文件级的 `com.apple.quicktime.content.identifier` 和轨级的
-    /// `still-image-time` 都会被丢掉，抖音收到一个干净 mp4。
+    /// 打开系统分享面板，把文件交给抖音。
     private func share(_ mode: ShareMode) {
-        guard !preparing else { return }
         switch mode {
-        case .livePhotoObject:
-            guard let photo = livePhoto else {
-                share(.liveMovie)
-                return
-            }
-            Diagnostics.mark("share.live-photo-obj")
-            shareItems = [photo]
-            showShare = true
-
         case .liveMovie:
             guard let url = shot.videoURL else { return }
             Diagnostics.mark("share.live-movie")
             shareItems = [url]
             showShare = true
-
-        case .liveBundle:
-            var items: [Any] = []
-            if let still = shot.stillURL { items.append(still) }
-            if let mov = shot.videoURL { items.append(mov) }
-            guard !items.isEmpty else { return }
-            Diagnostics.mark("share.live-bundle")
-            shareItems = items
-            showShare = true
-
-        case .compatMP4:
-            guard let url = shot.videoURL else { return }
-            preparing = true
-            Diagnostics.mark("share.compat-begin")
-            LivePhotoWriter.transcodeCompat(url) { result in
-                DispatchQueue.main.async {
-                    preparing = false
-                    switch result {
-                    case .success(let out):
-                        shareItems = [out]
-                    case .failure:
-                        // 转码失败不能拦住用户：原片照样能发
-                        Diagnostics.mark("share.compat-failed")
-                        shareItems = [url]
-                    }
-                    showShare = !shareItems.isEmpty
-                }
-            }
         }
     }
 
