@@ -211,8 +211,8 @@ struct LivePhotoPreviewSheet: View {
                     // 从相册「动图」进去 → 动图体裁（角标有，但分享出去标的是「动图」）；
                     // 从别的 App 把视频文件分享给抖音 → 视频体裁（剪映走的就是这条）。
                     VStack(spacing: 3) {
-                        Text("要「视频」体裁：点「发布到抖音」，在分享面板里选抖音")
-                        Text("从相册上传（含动图入口）一律是图文，再短也一样")
+                        Text("点「发布到抖音」→ 在面板里选「抖音」（用过一次会排到最前）")
+                        Text("从相册上传一律是图文，再短也一样")
                     }
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.yellow.opacity(0.85))
@@ -461,6 +461,16 @@ private struct ActivitySheet: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> UIActivityViewController {
         let controller = UIActivityViewController(activityItems: items,
                                                   applicationActivities: nil)
+        // iOS 不允许指定分享目标，也不允许给第三方 App 排序（排序取决于用户使用频次），
+        // 唯一能做的就是把这个列表瘦下来：系统自带的邮件/信息/打印/拷贝/存相册全部排除，
+        // 剩下的基本就是抖音、微信、隔空投送，抖音更容易在首屏出现。
+        controller.excludedActivityTypes = [
+            .addToReadingList, .assignToContact, .copyToPasteboard, .mail,
+            .markupAsPDF, .message, .openInWhatsApp, .postToFacebook,
+            .postToFlickr, .postToTencentWeibo, .postToTwitter, .postToVimeo,
+            .postToWeibo, .print, .saveToCameraRoll, .sharePlay,
+            .collaborationInviteWithLink, .collaborationCopyLink
+        ]
         // iPad / 分屏下必须给 popover 一个锚点，否则弹出即崩
         if let popover = controller.popoverPresentationController {
             popover.permittedArrowDirections = []
