@@ -1,6 +1,7 @@
 import Foundation
 import Photos
 import UIKit
+import AVFoundation
 
 enum LivePhotoWriterError: LocalizedError {
     case denied
@@ -240,6 +241,130 @@ enum LivePhotoWriter {
                 }
             }
         }
+    }
+
+    /// 转成「抖音友好」的容器：H.264 + 一条静音音轨 + mp4。
+    ///
+    /// 我们出的是 HEVC、无音轨、3:4；剪映导出物是 H.264、带音轨。
+    /// 既然 App 间分享是唯一能把体裁做成「视频」的通道，那交出去的文件
+    /// 就尽量贴近一个「正常视频」，别让它因为编码特殊被走别的处理链。
+    /// 转码失败不抛给用户，由调用方降级用原片。
+    static func transcodeCompat(_ video: URL,
+                                completion: @escaping (Result<URL, Error>) -> Void) {
+        Diagnostics.mark("compat.begin")
+        let asset = AVAsset(url: video)
+        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+            completion(.failure(LivePhotoWriterError.failed("读不到视频轨")))
+            return
+        }
+        let duration = asset.duration
+        guard duration.isNumeric, duration.seconds > 0 else {
+            completion(.failure(LivePhotoWriterError.failed("时长不可用")))
+            return
+        }
+
+        let temp = FileManager.default.temporaryDirectory
+        let silentURL = temp.appendingPathComponent("dtc-silent.wav")
+        let outURL = temp.appendingPathComponent("dtc-douyin.mp4")
+        try? FileManager.default.removeItem(at: outURL)
+
+        var audioTrack: AVAssetTrack?
+        do {
+            try makeSilentAudio(seconds: duration.seconds, to: silentURL)
+            audioTrack = AVAsset(url: silentURL).tracks(withMediaType: .audio).first
+        } catch {
+            // 静音轨造不出来就退回无声版，至少编码能对齐
+            Diagnostics.mark("compat.silent-failed")
+            audioTrack = nil
+        }
+
+        let composition = AVMutableComposition()
+        guard let compVideo = composition.addMutableTrack(withMediaType: .video,
+                                                          preferredTrackID: kCMPersistentTrackID_Invalid) else {
+            completion(.failure(LivePhotoWriterError.failed("无法创建合成轨")))
+            return
+        }
+        do {
+            try compVideo.insertTimeRange(CMTimeRange(start: .zero, duration: duration),
+                                          of: videoTrack, at: .zero)
+            // 方向由 transform 承载，丢了就又回到「正拍变横屏」
+            compVideo.preferredTransform = videoTrack.preferredTransform
+            if let audioTrack,
+               let compAudio = composition.addMutableTrack(withMediaType: .audio,
+                                                           preferredTrackID: kCMPersistentTrackID_Invalid) {
+                let audioRange = CMTimeRange(start: .zero,
+                                             duration: CMTimeMinimum(duration, audioTrack.timeRange.duration))
+                try compAudio.insertTimeRange(audioRange, of: audioTrack, at: .zero)
+            }
+        } catch {
+            Diagnostics.mark("compat.insert-failed")
+            completion(.failure(LivePhotoWriterError.failed("合成失败：\(error.localizedDescription)")))
+            return
+        }
+
+        guard let exporter = AVAssetExportSession(asset: composition,
+                                                  presetName: AVAssetExportPresetHighestQuality) else {
+            completion(.failure(LivePhotoWriterError.failed("无法创建导出会话")))
+            return
+        }
+        exporter.outputURL = outURL
+        exporter.outputFileType = exporter.supportedFileTypes.contains(.mp4) ? .mp4 : .mov
+        exporter.shouldOptimizeForNetworkUse = true
+        exporter.exportAsynchronously {
+            if exporter.status == .completed {
+                Diagnostics.mark("compat.export-ok")
+                completion(.success(outURL))
+            } else {
+                Diagnostics.mark("compat.export-failed")
+                let reason = exporter.error?.localizedDescription ?? "状态 \(exporter.status.rawValue)"
+                completion(.failure(LivePhotoWriterError.failed("转码失败：\(reason)")))
+            }
+        }
+    }
+
+    /// 转码后存相册。转码失败就存原片，不让用户白等一次拍摄。
+    static func saveCompatVideo(_ video: URL, completion: @escaping (Result<Void, Error>) -> Void) {
+        transcodeCompat(video) { result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let url):
+                    saveVideo(url, completion: completion)
+                case .failure:
+                    saveVideo(video, completion: completion)
+                }
+            }
+        }
+    }
+
+    /// 造一条静音 PCM 轨。
+    ///
+    /// 抖音里正常的视频都带音轨；我们此前全程无音轨，是最可疑的差异之一。
+    /// 全零 PCM 写成 wav，导出时由系统转成 AAC。
+    private static func makeSilentAudio(seconds: Double, to url: URL) throws {
+        try? FileManager.default.removeItem(at: url)
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: 44100.0,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+        let file = try AVAudioFile(forWriting: url, settings: settings)
+        let pcm = file.processingFormat
+        let frames = AVAudioFrameCount(max(1, seconds * pcm.sampleRate))
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: pcm, frameCapacity: frames) else {
+            throw LivePhotoWriterError.failed("无法创建静音缓冲")
+        }
+        buffer.frameLength = frames
+        // AVAudioPCMBuffer 的内存不保证清零，必须显式写 0，否则是爆音
+        if let channels = buffer.floatChannelData {
+            for index in 0..<Int(pcm.channelCount) {
+                memset(channels[index], 0, Int(frames) * MemoryLayout<Float>.size)
+            }
+        }
+        try file.write(from: buffer)
     }
 
     // MARK: - 权限
