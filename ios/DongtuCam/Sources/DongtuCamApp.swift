@@ -4,7 +4,7 @@ import UIKit
 
 /// 构建标识：界面右上角显示，同时写进崩溃日志的启动行。
 /// 崩溃现场靠它区分「这次崩的是哪个包」—— 装错包、或看到上一版的旧现场时一眼能认出。
-let appBuildTag = "v27"
+let appBuildTag = "v28"
 
 @main
 struct DongtuCamApp: App {
@@ -93,6 +93,15 @@ struct ContentView: View {
 
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
     private let buildTag = appBuildTag
+
+    /// 单次拍摄时长（秒）。
+    ///
+    /// **3.2 是平台的硬约束，不是审美选择**：
+    /// - 剪映导出实况时会提示「实况图最长 3.9 秒，部分平台无法正常播放超此时长的实况图」；
+    /// - 抖音自己拍的「动图」也是 3 秒左右；
+    /// - iOS 原生实况本身就是 3 秒（前后各 1.5s）。
+    /// 之前录 5 秒，实况超出规格，抖音那边就容易降级成普通图文（没有动效、没有动图角标）。
+    private static let captureSeconds: Double = 3.2
 
     /// 取景框矩形：**成片画幅**，垂直居中在「顶栏与快门之间」的那段空间里。
     ///
@@ -549,14 +558,14 @@ struct ContentView: View {
         phase = .recording
         lastError = nil
         lastRecognition = nil
-        statusText = "录制 5 秒…"
+        statusText = "录制 \(Int(Self.captureSeconds.rounded())) 秒…"
         Diagnostics.mark("shutter")
 
         // 快门按下的这一刻，屏幕上是什么字，成片就是什么字。
         // 处理期间 AI 可能又换了一条文案，那是给下一拍用的。
         let shotLines = copyEngine.lines
 
-        camera.capture(seconds: 5.0) { result in
+        camera.capture(seconds: Self.captureSeconds) { result in
             switch result {
             case .failure(let error):
                 self.phase = .failed(error.localizedDescription)
@@ -693,11 +702,39 @@ struct ContentView: View {
     /// 出片成功：把封面挂到左下角。
     /// 缩略图取自本地 still.heic，不依赖相册权限；`identifier` 用来点开时回读实况。
     @MainActor
-    private func publishShot(still: URL, identifier: String?, isLive: Bool?) {
+    private func publishShot(still: URL, identifier: String?, isLive: Bool?, video: URL? = nil) {
         let thumb = ShotThumbnailMaker.image(from: still)
         Diagnostics.mark(thumb == nil ? "shot.thumb-nil" : "shot.thumb-ok")
         withAnimation(.easeOut(duration: 0.26)) {
-            lastShot = ShotResult(thumbnail: thumb, localIdentifier: identifier, isLive: isLive)
+            lastShot = ShotResult(thumbnail: thumb,
+                                  localIdentifier: identifier,
+                                  isLive: isLive,
+                                  videoURL: Self.cacheMotionVideo(video))
+        }
+    }
+
+    /// 把这一拍的静音动图复制到缓存区。
+    ///
+    /// 暂存目录在 `ShotStore.finish` 时会被整个删掉，而「存成动图视频」是用户
+    /// 几秒之后才点的 —— 不提前复制一份，那个按钮就是个摆设。
+    /// 只留最新一条（覆盖写），占几 MB，不会滚成雪球。
+    private static func cacheMotionVideo(_ source: URL?) -> URL? {
+        guard let source, FileManager.default.fileExists(atPath: source.path) else {
+            Diagnostics.mark("motion.cache-skip")
+            return nil
+        }
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("dtc-motion", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent("latest.mov")
+        try? FileManager.default.removeItem(at: dest)
+        do {
+            try FileManager.default.copyItem(at: source, to: dest)
+            Diagnostics.mark("motion.cache-ok")
+            return dest
+        } catch {
+            Diagnostics.mark("motion.cache-failed")
+            return nil
         }
     }
 
@@ -835,14 +872,15 @@ struct ContentView: View {
                     ShotStore.shared.finish(shotID)
                     phase = .done
                     lastError = nil
-                    // 左下角挂上这一拍的缩略图（点开能播实况 + 跳相册）
+                    // 左下角挂上这一拍的缩略图（点开能播实况 + 跳相册 + 另存动图视频）
                     publishShot(still: still.url,
                                 identifier: outcome.localIdentifier,
-                                isLive: outcome.verifiedLive)
+                                isLive: outcome.verifiedLive,
+                                video: video.url)
                     // 拿到完整相册权限时会回读确认；确认不了就不把话说满
                     statusText = outcome.verifiedLive == true
-                        ? "已存入相册 · 系统已确认是实况 · 抖音「+ → 相册 → 动图」直接发"
-                        : "已存入相册 · 抖音「+ → 相册 → 动图」直接发"
+                        ? "已存入相册 · 系统已确认是实况 · 想要视频版点左下角「存成动图视频」"
+                        : "已存入相册 · 想要视频版点左下角「存成动图视频」"
                     Diagnostics.clear()
                     return
                 } catch {
@@ -908,8 +946,9 @@ struct ContentView: View {
         } else {
             phase = .done
             ShotStore.shared.finish(shotID)
-            // 实况没配上也算出片：缩略图照样挂上，只是没有相册标识
-            publishShot(still: still, identifier: nil, isLive: false)
+            // 实况没配上也算出片：缩略图照样挂上，只是没有相册标识。
+            // 视频已经单独存进相册了，这里只把缓存副本留一份，别让「存成动图视频」变灰。
+            publishShot(still: still, identifier: nil, isLive: false, video: video)
             statusText = "已存\(saved.joined(separator: " + "))（实况没配上）"
             lastError = "\(buildTag) 实况配对未成功，已分存\n\(reason)\n\(report)"
         }
