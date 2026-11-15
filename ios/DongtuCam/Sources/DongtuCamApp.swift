@@ -4,7 +4,7 @@ import UIKit
 
 /// 构建标识：界面右上角显示，同时写进崩溃日志的启动行。
 /// 崩溃现场靠它区分「这次崩的是哪个包」—— 装错包、或看到上一版的旧现场时一眼能认出。
-let appBuildTag = "v24"
+let appBuildTag = "v25"
 
 @main
 struct DongtuCamApp: App {
@@ -60,6 +60,8 @@ struct ContentView: View {
     @StateObject private var camera = CameraEngine()
     @StateObject private var copyEngine = CopyEngine()
     @StateObject private var aiSettings = AISettings()
+    /// 文字样式（字体/字号/位置）：持久化，下次打开直接沿用
+    @StateObject private var textStyle = TextStyleStore()
 
     @State private var phase: Phase = .idle
     @State private var permission = false
@@ -75,6 +77,15 @@ struct ContentView: View {
     @State private var showShotPreview = false
     /// 画面调节面板是否展开
     @State private var showAdjust = false
+    /// 文字编辑面板是否展开
+    @State private var showTextEditor = false
+    /// 文字可用宽度占画面的比例。
+    ///
+    /// 相机预览按 aspectFill 铺满全屏，3:4 的画面在长屏手机上会被裁掉两边；
+    /// 文字若按整个画面宽度排，长句在预览里就会「溢出屏幕」。
+    /// 这个值把排版宽度收窄到「屏幕上实际看得见的那一段」，
+    /// 预览与成片用同一个数，所以两边都不外溢、换行位置也一致。
+    @State private var textMaxWidthRatio: CGFloat = 0.92
     /// 自动识别：正在处理一帧时挡住后续帧（相机 2.5 秒一帧，重叠处理会白耗 CPU）
     @State private var scanning = false
     /// 已经为哪个商品生成过文案，避免同一款反复请求 AI
@@ -82,8 +93,6 @@ struct ContentView: View {
 
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
     private let buildTag = appBuildTag
-    /// 预览文字的磅值（和下面 copyPreview 里的 13 保持一致）
-    private let previewFontPt: CGFloat = 13
 
     var body: some View {
         ZStack {
@@ -99,9 +108,20 @@ struct ContentView: View {
                 .foregroundStyle(.white)
             }
 
+            // 文字层：和成片走同一套排版（TextLayer），
+            // 所以屏幕上的字体、字号、位置、描边就是最终要烧进画面的样子
+            TextOverlay(lines: copyEngine.lines,
+                        style: $textStyle.style,
+                        aspect: camera.displayAspect,
+                        onTap: toggleTextEditor)
+                .ignoresSafeArea()
+                .onPreferenceChange(TextWidthRatioKey.self) { ratio in
+                    textMaxWidthRatio = ratio
+                }
+
             VStack(spacing: 0) {
                 topBar
-                copyPreview
+                copyBadge
                 Spacer()
                 if let lastError {
                     Text(lastError)
@@ -114,6 +134,15 @@ struct ContentView: View {
                         .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 9))
                         .padding(.horizontal, 14)
                         .padding(.bottom, 6)
+                }
+                if showTextEditor {
+                    TextEditorPanel(text: copyText,
+                                    style: $textStyle.style,
+                                    onRegenerate: regenerateCopy,
+                                    onResetLayout: { textStyle.reset() },
+                                    onDone: { withAnimation(.easeOut(duration: 0.24)) { showTextEditor = false } })
+                        .padding(.bottom, 8)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
                 if showAdjust {
                     adjustPanel
@@ -222,11 +251,18 @@ struct ContentView: View {
                 icon("doc.on.clipboard")
             }
 
-            Button {
-                Task { await copyEngine.refresh(config: aiSettings.config,
-                                                recognition: lastRecognition) }
-            } label: {
+            Button(action: regenerateCopy) {
                 icon("arrow.triangle.2.circlepath")
+            }
+
+            // 文字：改内容 / 字体 / 字号（点画面上的文字同效）
+            Button(action: toggleTextEditor) {
+                Image(systemName: "textformat")
+                    .font(.subheadline.weight(.semibold))
+                    .padding(9)
+                    .background(showTextEditor ? Color.yellow : Color.white.opacity(0.18),
+                                in: Circle())
+                    .foregroundStyle(showTextEditor ? Color.black : Color.white)
             }
 
             Button { showSettings = true } label: {
@@ -254,52 +290,52 @@ struct ContentView: View {
             .background(.ultraThinMaterial, in: Circle())
     }
 
-    /// 固定 3 个位置、用「新建的数组」渲染。
-    /// 不能用 ForEach(lines.indices, id: \.self)：AI 返回行数变化时
-    /// SwiftUI 会拿旧索引去取新数组，是典型的越界闪退来源。
-    private var previewLines: [String] {
-        let source = copyEngine.lines
-        return (0..<3).map { index in index < source.count ? source[index] : "" }
+    /// 文字面板开合。和画面调节互斥，否则两块面板叠起来会把画面挤没。
+    private func toggleTextEditor() {
+        withAnimation(.easeOut(duration: 0.24)) {
+            showTextEditor.toggle()
+            if showTextEditor { showAdjust = false }
+        }
     }
 
-    /// 只是拍前预览，不会进画面；真正烧录由 TextLayer 完成
-    private var copyPreview: some View {
-        VStack(spacing: 3) {
-            HStack(spacing: 6) {
-                Text(copyEngine.badge)
-                    .font(.system(size: 9, weight: .black))
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1.5)
-                    .background(copyEngine.badge == "AI" ? Color.orange : Color.white.opacity(0.28),
-                                in: Capsule())
-                    .foregroundStyle(.white)
-                if aiSettings.config.enabled == false {
-                    Text("未启用 AI")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.55))
-                }
-            }
+    /// 文案编辑的双向绑定。
+    ///
+    /// 直接读写 `copyEngine.lines`，不另存一份草稿 —— 面板上敲的每个字都立刻
+    /// 反映到画面上的文字层，这才叫边改边看。
+    private var copyText: Binding<String> {
+        Binding(get: { copyEngine.lines.joined(separator: "\n") },
+                set: { copyEngine.edit($0) })
+    }
 
-            ForEach(Array(previewLines.enumerated()), id: \.offset) { _, line in
-                if !line.isEmpty {
-                    Text(line)
-                        .font(.system(size: previewFontPt, weight: .bold))
-                        .foregroundStyle(.white)
-                        .multilineTextAlignment(.center)
-                        .shadow(color: .black.opacity(0.85), radius: 2.5)
-                }
-            }
+    private func regenerateCopy() {
+        Task { await copyEngine.refresh(config: aiSettings.config,
+                                        recognition: lastRecognition) }
+    }
 
-            if let note = copyEngine.note {
-                Text(note)
-                    .font(.system(size: 9.5))
-                    .foregroundStyle(.white.opacity(0.65))
-                    .multilineTextAlignment(.center)
-                    .padding(.top, 1)
+    /// 文案来源角标。文字本身已经画在画面上了，这里只留极简的状态提示。
+    private var copyBadge: some View {
+        HStack(spacing: 6) {
+            Text(copyEngine.badge)
+                .font(.system(size: 9, weight: .black))
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1.5)
+                .background(copyEngine.badge == "AI" ? Color.orange : Color.white.opacity(0.28),
+                            in: Capsule())
+                .foregroundStyle(.white)
+            if aiSettings.config.enabled == false {
+                Text("未启用 AI")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.55))
             }
+            if copyEngine.isManual {
+                Text("已手动编辑")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.yellow.opacity(0.92))
+            }
+            Spacer(minLength: 0)
         }
         .padding(.horizontal, 16)
-        .padding(.top, 10)
+        .padding(.top, 7)
     }
 
     private var statusBar: some View {
@@ -346,7 +382,11 @@ struct ContentView: View {
 
             // 右：画面调节
             Button {
-                withAnimation(.easeOut(duration: 0.24)) { showAdjust.toggle() }
+                withAnimation(.easeOut(duration: 0.24)) {
+                    showAdjust.toggle()
+                    // 两个面板互斥：同时展开会把画面挤没
+                    if showAdjust { showTextEditor = false }
+                }
             } label: {
                 Image(systemName: "slider.horizontal.3")
                     .font(.system(size: 17, weight: .bold))
@@ -458,6 +498,10 @@ struct ContentView: View {
         statusText = "录制 5 秒…"
         Diagnostics.mark("shutter")
 
+        // 快门按下的这一刻，屏幕上是什么字，成片就是什么字。
+        // 处理期间 AI 可能又换了一条文案，那是给下一拍用的。
+        let shotLines = copyEngine.lines
+
         camera.capture(seconds: 5.0) { result in
             switch result {
             case .failure(let error):
@@ -466,7 +510,7 @@ struct ContentView: View {
                 self.statusText = "录制失败（详情见下方）"
                 Diagnostics.clear()
             case .success(let url):
-                self.process(url)
+                self.process(url, shotLines: shotLines)
             }
         }
     }
@@ -489,6 +533,13 @@ struct ContentView: View {
     /// frame 为 nil 表示没取到画面，此时只走 AI（无图）/ 本地模板
     @MainActor
     private func prepareCopy(frame: CGImage?) async {
+        // 用户手动改过文案：这一拍就按他改的出，不识别、也不调 AI。
+        // 人家明明调过措辞，拍一次又被换掉，那「编辑」就形同虚设 —— 想换请点「换一条」。
+        if copyEngine.isManual, !copyEngine.lines.isEmpty {
+            Diagnostics.mark("copy.manual-skip")
+            return
+        }
+
         var recognition: Recognition?
 
         if let frame, recognitionNeeded {
@@ -611,31 +662,25 @@ struct ContentView: View {
     /// 后台渲染文字层。UIGraphicsImageRenderer 支持在非主线程跑，
     /// 大画布（上千万像素）放主线程会让界面卡住几百毫秒。
     private static func overlayInBackground(lines: [String], size: CGSize,
-                                            previewFontPt: CGFloat,
-                                            screenWidth: CGFloat) async -> CGImage? {
+                                            style: TextStyle,
+                                            maxWidthRatio: CGFloat) async -> CGImage? {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 let image = autoreleasepool {
-                    TextLayer.make(lines: lines, size: size,
-                                   previewFontPt: previewFontPt,
-                                   screenWidthPt: screenWidth)
+                    TextLayer.make(lines: lines, style: style, canvas: size,
+                                   maxWidthRatio: maxWidthRatio)
                 }
                 continuation.resume(returning: image)
             }
         }
     }
 
-    /// 屏幕宽度（pt）。不用已废弃的 UIScreen.main。
-    @MainActor
-    private static var screenWidthPt: CGFloat {
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        if let width = scenes.first?.screen.bounds.width, width > 0 { return width }
-        return 393
-    }
-
     // MARK: - 一次快门 = 完整链路（每一级都能失败，失败就降级，绝不白拍）
 
-    private func process(_ source: URL) {
+    /// - Parameter shotLines: **按下快门那一刻屏幕上显示的文案**。
+    ///   出片用它，而不是处理完再看 `copyEngine.lines` —— 后者可能已经被
+    ///   AI 重新生成过，那样烧进画面的字就和用户按快门时看到的不一样了。
+    private func process(_ source: URL, shotLines: [String]) {
         Task { @MainActor in
             phase = .processing
             Diagnostics.mark("process.begin")
@@ -656,21 +701,27 @@ struct ContentView: View {
             }
             Diagnostics.mark("process.frame-ok")
 
-            // 2) 文案：识别失败/网络失败都不影响出片，本地模板兜底
+            // 2) 文案：识别失败/网络失败都不影响出片，本地模板兜底。
+            //    用户手动改过时不再让 AI 覆盖（prepareCopy 内部判断）。
             await prepareCopy(frame: recognitionNeeded ? frame : nil)
             if copyEngine.lines.isEmpty { copyEngine.regenerate() }
             Diagnostics.mark("process.copy")
 
+            // 这一拍到底用哪几句：快门那一刻的屏幕内容优先
+            let burnLines = shotLines.isEmpty ? copyEngine.lines : shotLines
+            let style = textStyle.style
+            let maxWidthRatio = textMaxWidthRatio
+
             // 3) 文字层。失败不致命：出无字静帧，仍然能配成实况。
-            //    画布用 stillCanvasSize（显示尺寸的 1.5 倍）：
-            //    文字按更高像素渲染，缩到屏幕上看才锐利。
+            //    画布用 stillCanvasSize（显示尺寸的 2 倍）：文字按更高像素渲染，
+            //    缩到屏幕上看才锐利。排版参数与预览完全同一份，只是画布更大。
             let renderSize = BurnEngine.stillCanvasSize(for: frame)
             statusText = "排版文字…"
             Diagnostics.mark("process.text")
-            var overlay: CGImage? = await Self.overlayInBackground(lines: copyEngine.lines,
+            var overlay: CGImage? = await Self.overlayInBackground(lines: burnLines,
                                                                    size: renderSize,
-                                                                   previewFontPt: previewFontPt,
-                                                                   screenWidth: Self.screenWidthPt)
+                                                                   style: style,
+                                                                   maxWidthRatio: maxWidthRatio)
             Diagnostics.mark(overlay == nil ? "process.text-nil" : "process.text-ok")
 
             // 4) 静帧：做完立刻进暂存区，崩溃也有东西可恢复
@@ -701,8 +752,9 @@ struct ContentView: View {
             var video: VideoOutput?
             do {
                 video = try await Self.makeVideo(source: source,
-                                                 lines: copyEngine.lines,
-                                                 screenWidth: Self.screenWidthPt,
+                                                 lines: burnLines,
+                                                 style: style,
+                                                 maxWidthRatio: maxWidthRatio,
                                                  identifier: identifier)
             } catch {
                 Diagnostics.mark("process.video-failed")
@@ -829,14 +881,15 @@ struct ContentView: View {
         }
     }
 
-    private static func makeVideo(source: URL, lines: [String], screenWidth: CGFloat,
+    private static func makeVideo(source: URL, lines: [String], style: TextStyle,
+                                  maxWidthRatio: CGFloat,
                                   identifier: String) async throws -> VideoOutput {
         try await withCheckedThrowingContinuation {
             (continuation: CheckedContinuation<VideoOutput, Error>) in
             BurnEngine.makeVideo(source: source,
                                  lines: lines,
-                                 previewFontPt: 13,
-                                 screenWidthPt: screenWidth,
+                                 style: style,
+                                 maxWidthRatio: maxWidthRatio,
                                  identifier: identifier) { result in
                 continuation.resume(with: result)
             }
