@@ -55,6 +55,12 @@ final class CopyEngine: ObservableObject {
     /// 识别 / AI 的一句话反馈
     @Published private(set) var note: String?
 
+    /// 用户是否手动改过文案。
+    ///
+    /// 改过就**不再让 AI 自动覆盖**：人家明明调过措辞，拍一次又被换掉，
+    /// 那「编辑」就形同虚设。想重新生成请点「换一条」。
+    @Published private(set) var isManual = false
+
     private let rules: RuleBook?
     private var lastTemplateIndex = -1
     private static let lastKey = "dtc.lastProduct"
@@ -95,6 +101,22 @@ final class CopyEngine: ObservableObject {
         regenerateLocal()
     }
 
+    // MARK: 手动编辑
+
+    /// 用户改过的文案直接生效。
+    ///
+    /// 这里**不做 trim、不删空行**：编辑途中的空行往往正是用户正在敲的那一行，
+    /// 悄悄吃掉会让人以为键盘失灵。空行只在实际排版时被过滤（`TextLayer` 负责）。
+    /// 行数上限与排版上限一致（5 行），超出的部分丢掉而不是让字号被压到看不清。
+    func edit(_ text: String) {
+        var parts = text.components(separatedBy: "\n")
+        if parts.count > 5 { parts = Array(parts.prefix(5)) }
+        lines = parts
+        isManual = true
+        badge = "手动"
+        note = nil
+    }
+
     private func regenerateLocal() {
         guard let product = selected, let rules, !rules.templates.isEmpty else {
             lines = []
@@ -112,6 +134,8 @@ final class CopyEngine: ObservableObject {
         lines = Self.normalize(rules.templates[index].lines.map { Self.fill($0, with: product) },
                                product: product)
         badge = "本地"
+        // 换模板 = 放弃手动编辑
+        isManual = false
     }
 
     /// 文案固定收成 3 行。
@@ -180,6 +204,7 @@ final class CopyEngine: ObservableObject {
                 }
                 self.lines = Self.normalize(output.lines, product: self.selected)
                 self.badge = "AI"
+                self.isManual = false
                 self.note = "AI 文案 · " + (self.selected?.name ?? "")
             }
             return true
