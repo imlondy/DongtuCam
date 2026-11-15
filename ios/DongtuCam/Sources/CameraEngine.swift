@@ -101,6 +101,13 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
 
     @Published private(set) var isRecording = false
 
+    /// 成片画面的宽高比（显示方向，宽/高）。3:4 竖拍 = 0.75。
+    ///
+    /// 文字层要靠它把「归一化坐标」映射到屏幕上：相机预览是 aspectFill 铺满全屏、
+    /// 两头被裁掉，不按真实比例映射的话，预览里摆在商品左上角的字，
+    /// 到成片里会跑到别的地方去。
+    @Published private(set) var displayAspect: CGFloat = 0.75
+
     // MARK: 美化参数（全部是相机原生能力，预览实时可见、录制时直接固化进成片）
 
     /// 曝光补偿，单位 EV
@@ -151,7 +158,16 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
             Diagnostics.mark("camera.no-device")
             return false
         }
-        Self.selectThreeFourFormat(on: device)
+        if let format = Self.selectThreeFourFormat(on: device) {
+            // 显示方向的宽高比 = 短边 / 长边（编码是横向的，播放时转 90°）
+            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            let longSide = CGFloat(max(dims.width, dims.height))
+            let shortSide = CGFloat(min(dims.width, dims.height))
+            if longSide > 0 {
+                let aspect = shortSide / longSide
+                DispatchQueue.main.async { self.displayAspect = aspect }
+            }
+        }
         videoDevice = device
         // 曝光补偿的可调范围跟着设备走（iPhone 一般 ±2 EV，个别格式 ±8）
         let low = max(-2, device.minExposureTargetBias)
@@ -217,7 +233,9 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
     /// activeFormat。拍照格式喂给 `AVCaptureMovieFileOutput` 是无效组合，
     /// 一按快门就抛 ObjC 异常 → 闪退。
     /// 现在强制要求媒体子类型是视频编码（420v/420f/x420）。
-    private static func selectThreeFourFormat(on device: AVCaptureDevice) {
+    /// - Returns: 真正设上去的格式；失败返回 nil（此时保持系统默认）
+    @discardableResult
+    private static func selectThreeFourFormat(on device: AVCaptureDevice) -> AVCaptureDevice.Format? {
         let videoSubTypes: Set<FourCharCode> = [0x34323076, 0x34323066, 0x78343230]
         /// 8bit 的两种（420v / 420f）；`x420` 是 10bit HDR，静帧是 SDR，
         /// 混着来容易出现「视频 HDR、照片 SDR」的色偏，所以优先 8bit。
@@ -242,7 +260,7 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
         }
 
         let allVideoFormats = device.formats.filter(isVideo)
-        guard !allVideoFormats.isEmpty else { return }
+        guard !allVideoFormats.isEmpty else { return nil }
         let eightBitFormats = allVideoFormats.filter { eightBitSubTypes.contains(subType($0)) }
         let videoFormats = eightBitFormats.isEmpty ? allVideoFormats : eightBitFormats
 
@@ -274,13 +292,16 @@ final class CameraEngine: NSObject, ObservableObject, AVCaptureFileOutputRecordi
             }
             best = largest(wide.isEmpty ? videoFormats : wide)
         }
-        guard let best else { return }
+        guard let best else { return nil }
         do {
             try device.lockForConfiguration()
             device.activeFormat = best
             device.unlockForConfiguration()
+            return best
         } catch {
             // 降级：使用系统默认格式
+            Diagnostics.mark("camera.format-lockfail")
+            return nil
         }
     }
 
