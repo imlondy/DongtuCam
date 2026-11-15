@@ -4,7 +4,7 @@ import UIKit
 
 /// 构建标识：界面右上角显示，同时写进崩溃日志的启动行。
 /// 崩溃现场靠它区分「这次崩的是哪个包」—— 装错包、或看到上一版的旧现场时一眼能认出。
-let appBuildTag = "v30"
+let appBuildTag = "v31"
 
 @main
 struct DongtuCamApp: App {
@@ -877,10 +877,11 @@ struct ContentView: View {
                                 isLive: outcome.verifiedLive,
                                 video: video.url)
                     // 拿到完整相册权限时会回读确认；确认不了就不把话说满
-                    // 「动图」入口 + 编辑页那个靶心按钮，才是抖音给角标的开关，缺一不可
+                    // 两条通道产出的体裁不同：相册「动图」= 动图体裁（分享出去标「动图」），
+                    // App 间分享视频文件 = 视频体裁（剪映那条，分享出去标「视频」）
                     statusText = outcome.verifiedLive == true
-                        ? "已存入相册 · 抖音「+ → 相册 → 动图」选它，编辑页点右侧靶心图标变 ∞ 再发"
-                        : "已写入相册（未回读确认）· 抖音「+ → 相册 → 动图」选它，编辑页点靶心图标变 ∞"
+                        ? "已存入相册 · 点左下角缩略图，可「分享到抖音」或看发布路径"
+                        : "已写入相册（未回读确认）· 点左下角缩略图选发布路径"
                     Diagnostics.clear()
                     return
                 } catch {
