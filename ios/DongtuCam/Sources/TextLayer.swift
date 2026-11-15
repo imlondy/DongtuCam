@@ -90,12 +90,13 @@ enum TextLayer {
         format.opaque = false
         format.preferredRange = .standard
 
-        let image = UIGraphicsImageRenderer(size: rect.size, format: format).image { ctx in
+        let rendered = UIGraphicsImageRenderer(size: rect.size, format: format).image { ctx in
             // 坐标系搬过去：让线条的位标继续用画布坐标，绘制代码无需知道自己在被裁着画
             ctx.cgContext.translateBy(x: -rect.minX, y: -rect.minY)
             draw(layout, in: ctx.cgContext)
         }
-        return (image.cgImage, rect)
+        guard let cgImage = rendered.cgImage else { return nil }
+        return (cgImage, rect)
     }
 
     /// 按样式算出排版。预览与成片走的是同一条路，只是 `canvas` 不同。
