@@ -14,9 +14,13 @@ struct ShotResult: Identifiable {
     let localIdentifier: String?
     /// true = 系统已确认是实况；false = 只存成普通照片；nil = 没权限回读
     let isLive: Bool?
-    /// 这一拍的静音动图（已压字、已转正）。缓存区里的副本，
-    /// 拿去存成普通视频 —— 抖音的「动图」是视频体裁，走这条路才有进度条。
+    /// 这一拍的静音动图（已压字、已转正）。缓存区里的副本。
+    /// **这是带实况标记的原片**：文件级 `com.apple.quicktime.content.identifier`
+    /// + 轨级 `still-image-time` 都在里面，和相册里那张 HEIC 是配对的。
     let videoURL: URL?
+    /// 这一拍的封面 HEIC（缓存区副本）。和 `videoURL` 用同一个配对标识，
+    /// 两个文件一起交给抖音，才构成完整的「实况」。
+    let stillURL: URL?
     let createdAt = Date()
 
     /// 成片画幅（宽/高）。缩略图是带方向变换解码出来的，尺寸就是显示尺寸，
@@ -132,10 +136,13 @@ struct LivePhotoPreviewSheet: View {
     @State private var motionState: MotionSaveState = .idle
     @State private var showShare = false
     @State private var preparing = false
-    @State private var shareURL: URL?
-    /// 这段视频的真实形态（时长 / 有无音轨 / 分辨率）。
-    /// 抖音按体裁分流的依据就是这几个数，发之前先看见，省得发完再猜。
+    /// 交给系统分享面板的东西。可能是单个 .mov，也可能是 HEIC + MOV 两项
+    @State private var shareItems: [Any] = []
+    /// 这段视频的真实形态（时长 / 有无音轨 / 分辨率 / 编码 / 实况标记）。
+    /// 抖音判体裁的依据就在这几个数里，发之前先看见，省得发完再猜。
     @State private var videoInfo: String?
+    /// 原片里到底有没有实况标记。没有的话，抖音只会当成普通视频。
+    @State private var liveMarked = false
 
     private enum MotionSaveState: Equatable {
         case idle
@@ -202,17 +209,23 @@ struct LivePhotoPreviewSheet: View {
                     }
 
                     if let videoInfo {
-                        Text(videoInfo)
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(.white.opacity(0.5))
+                        VStack(spacing: 2) {
+                            Text(videoInfo)
+                                .font(.caption2.monospacedDigit())
+                                .foregroundStyle(.white.opacity(0.5))
+                            Text(liveMarked
+                                 ? "✓ 带实况标记（content.identifier + still-image-time）"
+                                 : "✗ 无实况标记 —— 抖音只会当成普通视频")
+                                .font(.caption2)
+                                .foregroundStyle(liveMarked ? .green.opacity(0.85) : .orange.opacity(0.9))
+                        }
                     }
 
-                    // 抖音的体裁由「上传通道」决定，不由文件决定：
-                    // 从相册「动图」进去 → 动图体裁（角标有，但分享出去标的是「动图」）；
-                    // 从别的 App 把视频文件分享给抖音 → 视频体裁（剪映走的就是这条）。
+                    // 验收标准只有一条：抖音**发布页左上角**有没有「动图」标。
+                    // 那是抖音收到素材时的即时判定，比发布后的作品页更早、更准。
                     VStack(spacing: 3) {
-                        Text("点「发布到抖音」→ 在面板里选「抖音」（用过一次会排到最前）")
-                        Text("从相册上传一律是图文，再短也一样")
+                        Text("验收标准：抖音发布页左上角出现「动图」标")
+                        Text("出现了就成了；没有就换下面的「实况包」再试一次")
                     }
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.yellow.opacity(0.85))
@@ -220,15 +233,17 @@ struct LivePhotoPreviewSheet: View {
                     .padding(.horizontal, 24)
 
                     HStack(spacing: 10) {
-                        // 唯一能把体裁做成「视频」的通道：把文件直接交给抖音。
-                        // 剪映的「发布到抖音」就是这条 —— 存到相册再上传，一样是图文。
+                        // 主路径：把**带实况标记的原片**交给抖音。
+                        // 之前几版都先转码成 mp4 —— AVAssetExportSession 会把
+                        // content.identifier 和 still-image-time 一起丢掉，
+                        // 抖音收到的是个干净视频，发布页自然没有「动图」标。
                         if shot.videoURL != nil {
-                            Button { shareToDouyin() } label: {
+                            Button { share(.liveMovie) } label: {
                                 Group {
                                     if preparing {
                                         HStack(spacing: 7) {
                                             ProgressView().tint(.black).scaleEffect(0.8)
-                                            Text("转码…")
+                                            Text("准备…")
                                         }
                                     } else {
                                         Label("发布到抖音", systemImage: "square.and.arrow.up")
@@ -250,6 +265,32 @@ struct LivePhotoPreviewSheet: View {
                                 .padding(.vertical, 12)
                                 .background(.white.opacity(0.18), in: Capsule())
                                 .foregroundStyle(.white)
+                        }
+                    }
+
+                    // 对照实验：同一条成片，三种交付形态各发一次。
+                    // 抖音的判定条件不公开，与其继续猜，不如让它自己给出答案。
+                    if shot.videoURL != nil {
+                        HStack(spacing: 8) {
+                            Button { share(.liveBundle) } label: {
+                                Label("实况包 HEIC+MOV", systemImage: "rectangle.stack")
+                                    .font(.caption2.weight(.medium))
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(.white.opacity(0.12), in: Capsule())
+                                    .foregroundStyle(.white.opacity(0.9))
+                            }
+                            .disabled(preparing || shot.stillURL == nil)
+
+                            Button { share(.compatMP4) } label: {
+                                Label("纯视频 mp4", systemImage: "film")
+                                    .font(.caption2.weight(.medium))
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(.white.opacity(0.12), in: Capsule())
+                                    .foregroundStyle(.white.opacity(0.9))
+                            }
+                            .disabled(preparing)
                         }
                     }
 
@@ -308,9 +349,7 @@ struct LivePhotoPreviewSheet: View {
         .onAppear(perform: load)
         .task(id: shot.id) { loadVideoInfo() }
         .sheet(isPresented: $showShare) {
-            if let url = shareURL {
-                ActivitySheet(items: [url])
-            }
+            ActivitySheet(items: shareItems)
         }
     }
 
@@ -329,11 +368,22 @@ struct LivePhotoPreviewSheet: View {
             let codec = track.map { Self.codecName($0) } ?? "?"
             let mbps = (track?.estimatedDataRate ?? 0) / 1_000_000
 
+            // 实况的两块物证：文件级配对标识 + 轨级 still-image-time。
+            // 抖音若按实况解析，读的就是这两个；少一个它只会当普通视频。
+            let identifier = asset.metadata.first {
+                ($0.key as? String) == "com.apple.quicktime.content.identifier"
+            }?.stringValue
+            let timedTracks = asset.tracks.filter { $0.mediaType == .metadata }.count
+            let marked = (identifier?.isEmpty == false) || timedTracks > 0
+
             var text = String(format: "%.1f 秒 · %.0f×%.0f · %d fps", seconds, size.width, size.height, fps)
             text += " · " + codec
             text += hasAudio ? " · 带音轨" : " · 无音轨"
             if mbps > 0.05 { text += String(format: " · %.1f Mbps", mbps) }
-            DispatchQueue.main.async { videoInfo = text }
+            DispatchQueue.main.async {
+                videoInfo = text
+                liveMarked = marked
+            }
         }
     }
 
@@ -390,30 +440,57 @@ struct LivePhotoPreviewSheet: View {
         }
     }
 
-    /// 把这拍的静音动图另存成相册里的普通视频。
+    /// 交给抖音的三种形态。抖音的判定条件没公开，只能让它自己挑。
+    private enum ShareMode {
+        /// 带实况标记的原片 .mov（首选）：H.264 + content.identifier + still-image-time
+        case liveMovie
+        /// HEIC + MOV 两项一起给：构成完整的实况，抖音若按配对解析就会认出「动图」
+        case liveBundle
+        /// 转码成 mp4 的纯视频（对照用，历史上就是这条没有「动图」标）
+        case compatMP4
+    }
+
+    /// 打开系统分享面板，把这一拍的素材交给抖音。
     ///
-    /// 抖音里「实况照片」和「动图」是两条产线：
-    /// - 实况 → 图文（图片体裁），封面会动但没有进度条；
-    /// - 短视频（≈3 秒、无音轨）→ 视频体裁，播放器打「动图」标、有进度条。
-    /// 同一份画面，用户想发哪个形态就取哪个。
-    /// 转成 H.264 + 静音音轨的 mp4，再弹系统分享面板交给抖音。
-    ///
-    /// 转码失败不阻断：降级用原片分享 —— 通道对了才有体裁，文件参数是次要的。
-    private func shareToDouyin() {
-        guard let url = shot.videoURL, !preparing else { return }
-        preparing = true
-        Diagnostics.mark("share.prepare")
-        LivePhotoWriter.transcodeCompat(url) { result in
-            DispatchQueue.main.async {
-                preparing = false
-                switch result {
-                case .success(let out):
-                    shareURL = out
-                case .failure:
-                    Diagnostics.mark("share.prepare-fallback")
-                    shareURL = url
+    /// **绝对不能再无条件转码**：`AVAssetExportSession` 只搬音视频轨，
+    /// 文件级的 `com.apple.quicktime.content.identifier` 和轨级的
+    /// `still-image-time` 都会被丢掉。抖音收到一个干净 mp4，发布页左上角
+    /// 就不会出现「动图」标 —— 这正是 v32/v33 的症状。
+    private func share(_ mode: ShareMode) {
+        guard !preparing else { return }
+        switch mode {
+        case .liveMovie:
+            guard let url = shot.videoURL else { return }
+            Diagnostics.mark("share.live-movie")
+            shareItems = [url]
+            showShare = true
+
+        case .liveBundle:
+            var items: [Any] = []
+            if let still = shot.stillURL { items.append(still) }
+            if let mov = shot.videoURL { items.append(mov) }
+            guard !items.isEmpty else { return }
+            Diagnostics.mark("share.live-bundle")
+            shareItems = items
+            showShare = true
+
+        case .compatMP4:
+            guard let url = shot.videoURL else { return }
+            preparing = true
+            Diagnostics.mark("share.compat-begin")
+            LivePhotoWriter.transcodeCompat(url) { result in
+                DispatchQueue.main.async {
+                    preparing = false
+                    switch result {
+                    case .success(let out):
+                        shareItems = [out]
+                    case .failure:
+                        // 转码失败不能拦住用户：原片照样能发
+                        Diagnostics.mark("share.compat-failed")
+                        shareItems = [url]
+                    }
+                    showShare = !shareItems.isEmpty
                 }
-                showShare = shareURL != nil
             }
         }
     }
