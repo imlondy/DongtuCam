@@ -131,6 +131,8 @@ struct LivePhotoPreviewSheet: View {
     @State private var albumUnavailable = false
     @State private var motionState: MotionSaveState = .idle
     @State private var showShare = false
+    @State private var preparing = false
+    @State private var shareURL: URL?
     /// 这段视频的真实形态（时长 / 有无音轨 / 分辨率）。
     /// 抖音按体裁分流的依据就是这几个数，发之前先看见，省得发完再猜。
     @State private var videoInfo: String?
@@ -209,8 +211,8 @@ struct LivePhotoPreviewSheet: View {
                     // 从相册「动图」进去 → 动图体裁（角标有，但分享出去标的是「动图」）；
                     // 从别的 App 把视频文件分享给抖音 → 视频体裁（剪映走的就是这条）。
                     VStack(spacing: 3) {
-                        Text("要「视频」体裁：点下面「分享到抖音」，在分享面板里选抖音")
-                        Text("要「动图」角标：+ → 相册 → 动图 → 选这张 → 靶心变 ∞")
+                        Text("要「视频」体裁：点「发布到抖音」，在分享面板里选抖音")
+                        Text("从相册上传（含动图入口）一律是图文，再短也一样")
                     }
                     .font(.caption2.weight(.medium))
                     .foregroundStyle(.yellow.opacity(0.85))
@@ -218,6 +220,29 @@ struct LivePhotoPreviewSheet: View {
                     .padding(.horizontal, 24)
 
                     HStack(spacing: 10) {
+                        // 唯一能把体裁做成「视频」的通道：把文件直接交给抖音。
+                        // 剪映的「发布到抖音」就是这条 —— 存到相册再上传，一样是图文。
+                        if shot.videoURL != nil {
+                            Button { shareToDouyin() } label: {
+                                Group {
+                                    if preparing {
+                                        HStack(spacing: 7) {
+                                            ProgressView().tint(.black).scaleEffect(0.8)
+                                            Text("转码…")
+                                        }
+                                    } else {
+                                        Label("发布到抖音", systemImage: "square.and.arrow.up")
+                                    }
+                                }
+                                .font(.subheadline.weight(.semibold))
+                                .padding(.horizontal, 18)
+                                .padding(.vertical, 12)
+                                .background(.white, in: Capsule())
+                                .foregroundStyle(.black)
+                            }
+                            .disabled(preparing)
+                        }
+
                         Button(action: openAlbum) {
                             Label("相册", systemImage: "photo.on.rectangle.angled")
                                 .font(.subheadline.weight(.semibold))
@@ -226,30 +251,17 @@ struct LivePhotoPreviewSheet: View {
                                 .background(.white.opacity(0.18), in: Capsule())
                                 .foregroundStyle(.white)
                         }
-
-                        // 剪映「分享到抖音」走的就是这条通道：把**视频文件**交给抖音。
-                        // 抖音收到文件按视频投稿处理，跟从相册选 PHAsset 是两条流水线。
-                        if shot.videoURL != nil {
-                            Button { showShare = true } label: {
-                                Label("分享到抖音", systemImage: "square.and.arrow.up")
-                                    .font(.subheadline.weight(.semibold))
-                                    .padding(.horizontal, 18)
-                                    .padding(.vertical, 12)
-                                    .background(.white, in: Capsule())
-                                    .foregroundStyle(.black)
-                            }
-                        }
                     }
 
-                    // 次要路径：只把视频落进相册，之后自己去相册发
+                    // 备用：只想把视频落进相册时用（从相册上传会是图文，别指望角标）
                     if shot.videoURL != nil {
-                        Button(action: saveMotionVideo) {
+                        Button { saveMotionVideo(compat: true) } label: {
                             Group {
                                 switch motionState {
                                 case .saving:
                                     HStack(spacing: 7) {
                                         ProgressView().tint(.white).scaleEffect(0.8)
-                                        Text("存视频…")
+                                        Text("存相册…")
                                     }
                                 case .done:
                                     Label("视频已存相册", systemImage: "checkmark.circle.fill")
@@ -259,17 +271,17 @@ struct LivePhotoPreviewSheet: View {
                                     Label("只存进相册（视频分类）", systemImage: "film")
                                 }
                             }
-                            .font(.caption.weight(.medium))
-                            .padding(.horizontal, 14)
+                            .font(.caption2.weight(.medium))
+                            .padding(.horizontal, 12)
                             .padding(.vertical, 8)
                             .background(.white.opacity(0.12), in: Capsule())
                             .foregroundStyle(.white.opacity(0.9))
                         }
-                        .disabled(motionState == .saving || motionState == .done)
+                        .disabled(saving)
                     }
 
                     if case .done = motionState {
-                        Text("已存进相册「视频」分类（相册里最新那条）。想少走一步就用上面的「分享到抖音」——它和剪映走的是同一条通道。")
+                        Text("已存进相册「视频」分类。注意：从相册上传会被抖音判成图文，要视频体裁仍然得走「发布到抖音」。")
                             .font(.caption2)
                             .foregroundStyle(.white.opacity(0.6))
                             .multilineTextAlignment(.center)
@@ -296,13 +308,14 @@ struct LivePhotoPreviewSheet: View {
         .onAppear(perform: load)
         .task(id: shot.id) { loadVideoInfo() }
         .sheet(isPresented: $showShare) {
-            if let url = shot.videoURL {
+            if let url = shareURL {
                 ActivitySheet(items: [url])
             }
         }
     }
 
     /// 读这段动图的真实参数。只读元数据，不解码画面。
+    /// 编码格式和码率也要看 —— 抖音判体裁的依据很可能就在这几个数里。
     private func loadVideoInfo() {
         guard let url = shot.videoURL else { return }
         DispatchQueue.global(qos: .utility).async {
@@ -313,10 +326,27 @@ struct LivePhotoPreviewSheet: View {
             let size = track?.naturalSize ?? .zero
             let fps = track.map { Int(($0.nominalFrameRate).rounded()) } ?? 0
             let hasAudio = !asset.tracks(withMediaType: .audio).isEmpty
-            let text = String(format: "%.1f 秒", seconds)
-                + " · " + (hasAudio ? "带音轨" : "无音轨")
-                + String(format: " · %.0f×%.0f · %d fps", size.width, size.height, fps)
+            let codec = track.map { Self.codecName($0) } ?? "?"
+            let mbps = (track?.estimatedDataRate ?? 0) / 1_000_000
+
+            var text = String(format: "%.1f 秒 · %.0f×%.0f · %d fps", seconds, size.width, size.height, fps)
+            text += " · " + codec
+            text += hasAudio ? " · 带音轨" : " · 无音轨"
+            if mbps > 0.05 { text += String(format: " · %.1f Mbps", mbps) }
             DispatchQueue.main.async { videoInfo = text }
+        }
+    }
+
+    private static func codecName(_ track: AVAssetTrack) -> String {
+        guard let desc = track.formatDescriptions.first else { return "?" }
+        let sub = CMFormatDescriptionGetMediaSubType(desc as! CMFormatDescription)
+        switch sub {
+        case kCMVideoCodecType_HEVC: return "HEVC"
+        case kCMVideoCodecType_H264: return "H.264"
+        default:
+            let bytes: [UInt8] = [UInt8((sub >> 24) & 0xFF), UInt8((sub >> 16) & 0xFF),
+                                  UInt8((sub >> 8) & 0xFF), UInt8(sub & 0xFF)]
+            return String(bytes: bytes, encoding: .ascii) ?? "未知编码"
         }
     }
 
@@ -366,11 +396,43 @@ struct LivePhotoPreviewSheet: View {
     /// - 实况 → 图文（图片体裁），封面会动但没有进度条；
     /// - 短视频（≈3 秒、无音轨）→ 视频体裁，播放器打「动图」标、有进度条。
     /// 同一份画面，用户想发哪个形态就取哪个。
-    private func saveMotionVideo() {
-        guard let url = shot.videoURL, motionState != .saving else { return }
+    /// 转成 H.264 + 静音音轨的 mp4，再弹系统分享面板交给抖音。
+    ///
+    /// 转码失败不阻断：降级用原片分享 —— 通道对了才有体裁，文件参数是次要的。
+    private func shareToDouyin() {
+        guard let url = shot.videoURL, !preparing else { return }
+        preparing = true
+        Diagnostics.mark("share.prepare")
+        LivePhotoWriter.transcodeCompat(url) { result in
+            DispatchQueue.main.async {
+                preparing = false
+                switch result {
+                case .success(let out):
+                    shareURL = out
+                case .failure:
+                    Diagnostics.mark("share.prepare-fallback")
+                    shareURL = url
+                }
+                showShare = shareURL != nil
+            }
+        }
+    }
+
+    private var saving: Bool {
+        if case .saving = motionState { return true }
+        return false
+    }
+
+    /// 把这一拍落进相册的「视频」分类。
+    ///
+    /// `compat = true` 会多走一遍转码：H.264 + 静音音轨 + mp4 容器，
+    /// 对齐剪映导出物的形态。两条都发一次，就能看出抖音到底按什么判体裁。
+    private func saveMotionVideo(compat: Bool) {
+        guard let url = shot.videoURL, !saving else { return }
         motionState = .saving
-        Diagnostics.mark("motion.save-begin")
-        LivePhotoWriter.saveVideo(url) { result in
+        Diagnostics.mark(compat ? "motion.save-compat" : "motion.save-begin")
+
+        let handler: (Result<Void, Error>) -> Void = { result in
             switch result {
             case .success:
                 Diagnostics.mark("motion.save-ok")
@@ -379,6 +441,12 @@ struct LivePhotoPreviewSheet: View {
                 Diagnostics.mark("motion.save-failed")
                 motionState = .failed(error.localizedDescription)
             }
+        }
+
+        if compat {
+            LivePhotoWriter.saveCompatVideo(url, completion: handler)
+        } else {
+            LivePhotoWriter.saveVideo(url, completion: handler)
         }
     }
 }
