@@ -4,7 +4,7 @@ import UIKit
 
 /// 构建标识：界面右上角显示，同时写进崩溃日志的启动行。
 /// 崩溃现场靠它区分「这次崩的是哪个包」—— 装错包、或看到上一版的旧现场时一眼能认出。
-let appBuildTag = "v33"
+let appBuildTag = "v34"
 
 @main
 struct DongtuCamApp: App {
@@ -708,7 +708,33 @@ struct ContentView: View {
             lastShot = ShotResult(thumbnail: thumb,
                                   localIdentifier: identifier,
                                   isLive: isLive,
-                                  videoURL: Self.cacheMotionVideo(video))
+                                  videoURL: Self.cacheMotionVideo(video),
+                                  stillURL: Self.cacheStillImage(still))
+        }
+    }
+
+    /// 把封面 HEIC 也复制进缓存区。
+    ///
+    /// 「实况包」分享要 HEIC + MOV 两个文件，而暂存目录在出片结束时会被删掉。
+    /// 扩展名必须保留 `.heic`：系统分享是按扩展名推断 UTI 的，
+    /// 换成 .dat 或没后缀，抖音那边就认不出是图片。
+    private static func cacheStillImage(_ source: URL) -> URL? {
+        guard FileManager.default.fileExists(atPath: source.path) else {
+            Diagnostics.mark("still.cache-skip")
+            return nil
+        }
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("dtc-motion", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dest = dir.appendingPathComponent("latest.heic")
+        try? FileManager.default.removeItem(at: dest)
+        do {
+            try FileManager.default.copyItem(at: source, to: dest)
+            Diagnostics.mark("still.cache-ok")
+            return dest
+        } catch {
+            Diagnostics.mark("still.cache-failed")
+            return nil
         }
     }
 
