@@ -4,7 +4,7 @@ import UIKit
 
 /// 构建标识：界面右上角显示，同时写进崩溃日志的启动行。
 /// 崩溃现场靠它区分「这次崩的是哪个包」—— 装错包、或看到上一版的旧现场时一眼能认出。
-let appBuildTag = "v25"
+let appBuildTag = "v26"
 
 @main
 struct DongtuCamApp: App {
@@ -94,30 +94,78 @@ struct ContentView: View {
     /// 显示在右上角的构建标识：装错包时一眼就能看出来
     private let buildTag = appBuildTag
 
+    /// 取景框矩形：**成片画幅**，垂直居中在「顶栏与快门之间」的那段空间里。
+    ///
+    /// - Parameters:
+    ///   - size: 安全区内的可用尺寸
+    ///   - aspect: 成片宽高比（3:4 = 0.75）；相机格式异常时回落 0.75
+    private static func viewfinderRect(in size: CGSize, aspect rawAspect: CGFloat) -> CGRect {
+        let aspect = (rawAspect.isFinite && rawAspect > 0.2 && rawAspect < 1.6) ? rawAspect : 0.75
+        // 顶栏 + 文案角标 ≈ 78；状态条 + 快门区 ≈ 186
+        let topReserve: CGFloat = 78
+        let bottomReserve: CGFloat = 186
+        let maxHeight = max(160, size.height - topReserve - bottomReserve)
+        var height = maxHeight
+        var width = height * aspect
+        if width > size.width {
+            width = size.width
+            height = width / aspect
+        }
+        let x = (size.width - width) / 2
+        let y = topReserve + (maxHeight - height) / 2
+        return CGRect(x: x, y: y, width: width, height: height)
+    }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            if permission {
-                CameraPreview(session: camera.session).ignoresSafeArea()
-            } else {
-                VStack(spacing: 10) {
-                    Image(systemName: "camera.fill").font(.largeTitle)
-                    Text("需要相机权限才能拍摄").font(.subheadline)
-                }
-                .foregroundStyle(.white)
-            }
+            // 取景框：**成片是什么画幅，预览就是什么画幅**。
+            //
+            // v25 之前预览是全屏 aspectFill，3:4 的画面在长屏手机上两边被裁掉，
+            // 屏幕上只看得见中间 61% —— 同一个字号在预览里显得大、在成片里显得小，
+            // 「所见即所得」在这一步就断了。现在把画面框成 3:4，
+            // 框外就是会被裁掉的区域（纯黑），字号与位置在两边完全等价。
+            GeometryReader { geo in
+                let frame = Self.viewfinderRect(in: geo.size, aspect: camera.displayAspect)
 
-            // 文字层：和成片走同一套排版（TextLayer），
-            // 所以屏幕上的字体、字号、位置、描边就是最终要烧进画面的样子
-            TextOverlay(lines: copyEngine.lines,
-                        style: $textStyle.style,
-                        aspect: camera.displayAspect,
-                        onTap: toggleTextEditor)
-                .ignoresSafeArea()
-                .onPreferenceChange(TextWidthRatioKey.self) { ratio in
-                    textMaxWidthRatio = ratio
+                ZStack {
+                    if permission {
+                        CameraPreview(session: camera.session)
+                            .frame(width: frame.width, height: frame.height)
+                            .clipped()
+                            .position(x: frame.midX, y: frame.midY)
+                    } else {
+                        VStack(spacing: 10) {
+                            Image(systemName: "camera.fill").font(.largeTitle)
+                            Text("需要相机权限才能拍摄").font(.subheadline)
+                        }
+                        .foregroundStyle(.white)
+                        .frame(width: frame.width, height: frame.height)
+                        .position(x: frame.midX, y: frame.midY)
+                    }
+
+                    // 取景框边线：框外不会出现在成片里
+                    RoundedRectangle(cornerRadius: 2, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.14), lineWidth: 1)
+                        .frame(width: frame.width, height: frame.height)
+                        .position(x: frame.midX, y: frame.midY)
+                        .allowsHitTesting(false)
+
+                    // 文字层：和成片走同一套排版（TextLayer），
+                    // 所以屏幕上的字体、字号、颜色、位置、描边就是最终要烧进画面的样子
+                    TextOverlay(lines: copyEngine.lines,
+                                style: $textStyle.style,
+                                aspect: camera.displayAspect,
+                                showGuides: showTextEditor,
+                                onTap: toggleTextEditor)
+                        .frame(width: frame.width, height: frame.height)
+                        .position(x: frame.midX, y: frame.midY)
+                        .onPreferenceChange(TextWidthRatioKey.self) { ratio in
+                            textMaxWidthRatio = ratio
+                        }
                 }
+            }
 
             VStack(spacing: 0) {
                 topBar
