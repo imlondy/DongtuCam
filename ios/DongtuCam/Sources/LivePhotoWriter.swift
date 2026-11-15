@@ -243,13 +243,13 @@ enum LivePhotoWriter {
         }
     }
 
-    /// 转成「抖音友好」的容器：H.264 + 一条静音音轨 + mp4。
+    /// 转成「抖音友好」的容器：H.264 + mp4。
     ///
-    /// 我们出的是 HEVC、无音轨、3:4；剪映导出物是 H.264、带音轨。
-    /// 既然 App 间分享是唯一能把体裁做成「视频」的通道，那交出去的文件
-    /// 就尽量贴近一个「正常视频」，别让它因为编码特殊被走别的处理链。
-    /// 转码失败不抛给用户，由调用方降级用原片。
+    /// 编码换成 H.264 是为了兼容：我们自己的成片是 HEVC，容易被走别的处理链。
+    /// **默认不塞音轨** —— 抖音的「动图」语义上是无声循环，v32 塞了静音轨之后
+    /// 用户实测"视频有了、角标没了"，所以这次把音轨去掉再验一次。
     static func transcodeCompat(_ video: URL,
+                                withAudio: Bool = false,
                                 completion: @escaping (Result<URL, Error>) -> Void) {
         Diagnostics.mark("compat.begin")
         let asset = AVAsset(url: video)
@@ -269,13 +269,14 @@ enum LivePhotoWriter {
         try? FileManager.default.removeItem(at: outURL)
 
         var audioTrack: AVAssetTrack?
-        do {
-            try makeSilentAudio(seconds: duration.seconds, to: silentURL)
-            audioTrack = AVAsset(url: silentURL).tracks(withMediaType: .audio).first
-        } catch {
-            // 静音轨造不出来就退回无声版，至少编码能对齐
-            Diagnostics.mark("compat.silent-failed")
-            audioTrack = nil
+        if withAudio {
+            do {
+                try makeSilentAudio(seconds: duration.seconds, to: silentURL)
+                audioTrack = AVAsset(url: silentURL).tracks(withMediaType: .audio).first
+            } catch {
+                Diagnostics.mark("compat.silent-failed")
+                audioTrack = nil
+            }
         }
 
         let composition = AVMutableComposition()
