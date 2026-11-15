@@ -171,9 +171,8 @@ enum BurnEngine {
     ///
     /// 压字失败不影响出片：降级到 `remux`（原样无损封装，只是画面里没有字），
     /// 实况配对、方向修正、时长都照旧。
-    static func makeVideo(source: URL, lines: [String],
-                          previewFontPt: CGFloat, screenWidthPt: CGFloat,
-                          identifier: String,
+    static func makeVideo(source: URL, lines: [String], style: TextStyle,
+                          maxWidthRatio: CGFloat, identifier: String,
                           completion: @escaping (Result<VideoOutput, Error>) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             if !lines.isEmpty {
@@ -181,8 +180,8 @@ enum BurnEngine {
                     let url = try FrameBurner.run(FrameBurner.Config(
                         source: source,
                         lines: lines,
-                        previewFontPt: previewFontPt,
-                        screenWidthPt: screenWidthPt,
+                        style: style,
+                        maxWidthRatio: maxWidthRatio,
                         identifier: identifier))
                     DispatchQueue.main.async {
                         completion(.success(VideoOutput(url: url, mode: "burn")))
