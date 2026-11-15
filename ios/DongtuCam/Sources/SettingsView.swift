@@ -16,7 +16,7 @@ struct AISettingsView: View {
     @State private var testOK = false
 
     /// 拍摄时长：和主界面的 @AppStorage 是同一个键，改完立刻生效
-    @AppStorage("dtc.captureSeconds") private var captureSeconds: Double = 3.0
+    @AppStorage("dtc.captureSeconds") private var captureSeconds: Double = 2.5
 
     var body: some View {
         NavigationStack {
@@ -46,9 +46,9 @@ struct AISettingsView: View {
     private var captureSection: some View {
         Section {
             Picker("拍摄时长", selection: $captureSeconds) {
-                Text("3 秒").tag(3.0)
-                Text("4 秒").tag(4.0)
-                Text("5 秒").tag(5.0)
+                Text("2 秒").tag(2.0)
+                Text("2.5 秒").tag(2.5)
+                Text("2.9 秒").tag(2.9)
             }
             .pickerStyle(.segmented)
 
@@ -62,12 +62,12 @@ struct AISettingsView: View {
 
     private var captureHint: String {
         switch captureSeconds {
-        case ..<3.5:
-            return "3 秒最接近抖音原生的「动图」，最容易被识别成带角标的视频。"
-        case ..<4.5:
-            return "4 秒在剪映推荐的实况长度（≤3.9 秒）附近，兼容性有保障。"
+        case ..<2.3:
+            return "最保险。抖音只认 3 秒以内的动图，越短越不容易被降级成静态图。"
+        case ..<2.8:
+            return "推荐。合成时还会再裁到 2.9 秒以内，稳定落在抖音的动图规格里。"
         default:
-            return "5 秒能发，但时长越长，抖音越容易当成普通视频或图文。"
+            return "贴上限。抖音的红线是 3 秒，超了会静默降级成静态图，不建议再往上加。"
         }
     }
 
