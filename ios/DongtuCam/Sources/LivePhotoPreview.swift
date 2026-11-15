@@ -14,6 +14,33 @@ struct ShotResult: Identifiable {
     /// true = 系统已确认是实况；false = 只存成普通照片；nil = 没权限回读
     let isLive: Bool?
     let createdAt = Date()
+
+    /// 成片画幅（宽/高）。缩略图是带方向变换解码出来的，尺寸就是显示尺寸，
+    /// 所以直接拿它的比例；真拿不到时退回 3:4（本 App 唯一的拍摄画幅）。
+    static func previewAspect(_ image: UIImage?) -> CGFloat {
+        guard let size = image?.size, size.width > 1, size.height > 1 else { return 3.0 / 4.0 }
+        let ratio = size.width / size.height
+        // 畸形值（0、NaN、极端长条）一律不采用，避免布局算出 0 高度
+        guard ratio.isFinite, ratio > 0.2, ratio < 5 else { return 3.0 / 4.0 }
+        return ratio
+    }
+
+    /// 把 aspect 的画面等比塞进 size：只留黑边，绝不拉伸。
+    static func fittedRect(aspect: CGFloat, in size: CGSize) -> CGRect {
+        guard aspect > 0.01, size.width > 1, size.height > 1 else {
+            return CGRect(origin: .zero, size: size)
+        }
+        let containerAspect = size.width / size.height
+        if aspect > containerAspect {
+            // 画面更宽 → 贴左右，上下留边
+            let h = size.width / aspect
+            return CGRect(x: 0, y: (size.height - h) / 2, width: size.width, height: h)
+        } else {
+            // 画面更高（3:4 属这一档）→ 贴上下，左右留边
+            let w = size.height * aspect
+            return CGRect(x: (size.width - w) / 2, y: 0, width: w, height: size.height)
+        }
+    }
 }
 
 /// 从本地文件生成缩略图。用 ImageIO 的 thumbnail 接口，
@@ -38,6 +65,10 @@ struct ShotThumbnail: View {
     let shot: ShotResult
     let action: () -> Void
 
+    /// 缩略图本身也是 3:4 —— 之前塞进正方形里，等于把画面裁掉一截，
+    /// 一眼看不出成片画幅（用户会以为拍出来是方的）。
+    private var aspect: CGFloat { ShotResult.previewAspect(shot.thumbnail) }
+
     var body: some View {
         Button(action: action) {
             ZStack(alignment: .bottomTrailing) {
@@ -54,10 +85,10 @@ struct ShotThumbnail: View {
                         }
                     }
                 }
-                .frame(width: 62, height: 62)
-                .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+                .frame(width: 56, height: 56 / max(aspect, 0.35))
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 13, style: .continuous)
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .strokeBorder(.white.opacity(0.9), lineWidth: 1.8)
                 )
 
@@ -87,18 +118,36 @@ struct LivePhotoPreviewSheet: View {
     @State private var status = "载入动图…"
     @State private var albumUnavailable = false
 
+    /// 成片比例，预览、缩略图、播放器三处共用同一个值
+    private var aspect: CGFloat { ShotResult.previewAspect(shot.thumbnail) }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            if let livePhoto {
-                LivePhotoPlayer(livePhoto: livePhoto)
-                    .ignoresSafeArea()
-            } else if let image = shot.thumbnail {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .ignoresSafeArea()
+            // 关键：画面锁定成片比例再摆放。
+            // 之前 PHLivePhotoView / Image 直接 .ignoresSafeArea() 铺满整屏，
+            // 屏幕约 0.46、成片 0.75，于是被横向压扁 —— 这就是"变形"的来源。
+            GeometryReader { geo in
+                let box = ShotResult.fittedRect(aspect: aspect, in: geo.size)
+
+                Group {
+                    if let livePhoto {
+                        LivePhotoPlayer(livePhoto: livePhoto)
+                    } else if let image = shot.thumbnail {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFit()
+                    } else {
+                        ZStack {
+                            Rectangle().fill(.white.opacity(0.08))
+                            ProgressView().tint(.white)
+                        }
+                    }
+                }
+                .frame(width: box.width, height: box.height)
+                .clipped()
+                .position(x: box.midX, y: box.midY)
             }
 
             VStack {
@@ -194,7 +243,11 @@ private struct LivePhotoPlayer: UIViewRepresentable {
 
     func makeUIView(context: Context) -> PHLivePhotoView {
         let view = PHLivePhotoView()
+        // 容器已经是成片比例的框，这里再兜一层：万一系统按自己的尺寸铺，
+        // aspectFit + clipsToBounds 也只会留黑边，不会拉伸
         view.contentMode = .scaleAspectFit
+        view.clipsToBounds = true
+        view.backgroundColor = .clear
         view.livePhoto = livePhoto
         view.startPlayback(with: .full)
         return view
