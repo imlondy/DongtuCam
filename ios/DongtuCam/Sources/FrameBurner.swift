@@ -38,6 +38,11 @@ enum FrameBurner {
         /// 文字可用宽度占比（与预览同一个值，保证换行位置也一样）
         let maxWidthRatio: CGFloat
         let identifier: String
+        /// 输出时长上限（秒）。**抖音的硬限制是 3 秒**：
+        /// 官方客服原话「超过 3 秒的动图仅支持发布为静态图片」。
+        /// 录制时长和编码后的实际时长不是一回事（落盘收尾会多出几十毫秒），
+        /// 所以这里必须再裁一刀，不能只靠 `capture(seconds:)`。
+        var maxSeconds: Double = 2.9
     }
 
     /// 输出最长边上限。相机格式最高到 1600 级，4K 机型也只降到 1920 —— 
@@ -70,6 +75,12 @@ enum FrameBurner {
         var duration = asset.duration
         if !duration.isNumeric || duration.seconds <= 0 {
             duration = CMTime(seconds: 5, preferredTimescale: 600)
+        }
+        // 裁到平台能认的动图长度。缩放比例用 600，和视频轨一致，避免累积误差
+        let cap = config.maxSeconds
+        if duration.seconds > cap {
+            duration = CMTime(seconds: cap, preferredTimescale: 600)
+            Diagnostics.mark("burnV.trim-\(String(format: "%.2f", cap))")
         }
         let fps = track.nominalFrameRate > 1 ? Double(track.nominalFrameRate) : 30.0
         let fpsInt = max(1, Int(fps.rounded()))
