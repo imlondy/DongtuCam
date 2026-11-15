@@ -219,7 +219,9 @@ struct ContentView: View {
         .sheet(isPresented: $showSettings) {
             AISettingsView(settings: aiSettings, copyEngine: copyEngine)
         }
-        .sheet(isPresented: $showShotPreview) {
+        // 用全屏而不是 sheet：sheet 顶部是圆角卡片，会裁掉画面四角，
+        // 也没法让黑底真正铺满，看图时会误以为是画幅不对
+        .fullScreenCover(isPresented: $showShotPreview) {
             if let lastShot {
                 LivePhotoPreviewSheet(shot: lastShot)
             }
