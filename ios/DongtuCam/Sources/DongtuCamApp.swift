@@ -4,7 +4,7 @@ import UIKit
 
 /// 构建标识：界面右上角显示，同时写进崩溃日志的启动行。
 /// 崩溃现场靠它区分「这次崩的是哪个包」—— 装错包、或看到上一版的旧现场时一眼能认出。
-let appBuildTag = "v34"
+let appBuildTag = "v35"
 
 @main
 struct DongtuCamApp: App {
