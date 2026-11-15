@@ -69,6 +69,14 @@ struct ShotThumbnail: View {
     /// 一眼看不出成片画幅（用户会以为拍出来是方的）。
     private var aspect: CGFloat { ShotResult.previewAspect(shot.thumbnail) }
 
+    /// 在底部控件的高度（62）内按比例适配，画面比例不被改动，也不会溢出到快门那一行
+    private var thumbSize: CGSize {
+        let maxW: CGFloat = 74
+        let maxH: CGFloat = 60
+        let w = min(maxW, maxH * aspect)
+        return CGSize(width: w, height: w / max(aspect, 0.01))
+    }
+
     var body: some View {
         Button(action: action) {
             ZStack(alignment: .bottomTrailing) {
@@ -85,10 +93,10 @@ struct ShotThumbnail: View {
                         }
                     }
                 }
-                .frame(width: 56, height: 56 / max(aspect, 0.35))
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .frame(width: thumbSize.width, height: thumbSize.height)
+                .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
                         .strokeBorder(.white.opacity(0.9), lineWidth: 1.8)
                 )
 
